@@ -29,9 +29,11 @@ def iter_records(raw_text):
             if not rest.startswith("||"):
                 yield lineno, head, None
                 continue
-            rest = rest[2:]
-            if not rest.strip():
-                # "头|||" 这种空数据体是删除墓碑，元素已不存在，跳过
+            # 删除墓碑写作「头|||」：剥掉两个分隔符后还剩一个孤立的 "|"，
+            # 不是一个空串。早先只判空串，这些行就掉进 JSONDecodeError 分支，
+            # 被当成解析失败统计，会淹没真正的解析错误。
+            rest = rest[2:].strip()
+            if rest in ("", "|"):
                 yield lineno, head, None
                 continue
             body, _ = _dec.raw_decode(rest)
@@ -64,6 +66,10 @@ def survey(path):
     for lineno, head, body in iter_records(text):
         if head is None:
             counts["<解析失败>"] += 1
+            continue
+        if body is None:
+            # 删除墓碑：元素已不存在，不能计入类型统计，否则计数虚高
+            counts["<墓碑>"] += 1
             continue
         t = head.get("type", "?")
         counts[t] += 1

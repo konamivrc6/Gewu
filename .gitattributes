@@ -10,3 +10,6 @@
 *.png  -text
 *.jpg  -text
 *.gerber -text
+
+# .epro2 实为 ZIP 容器，靠自动探测判二进制不可靠，显式排除
+*.epro2 -text

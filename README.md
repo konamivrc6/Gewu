@@ -33,7 +33,8 @@
 ## 软件栈
 
 - 平台：Arduino（板型 `AirM2M CORE ESP32C3`）或 ESP-IDF
-- flash 模式：DIO
+- 构建：`arduino-cli compile firmware/Hardware_Test`。板型、平台与库版本都钉在 `firmware/Hardware_Test/sketch.yaml` 里，缺什么会自动下载，换机器不必先配板管理器
+- flash 模式：DIO（本板型固定，无需设置）
 - 显示驱动：MAX7219 三线协议，3 个 GPIO
 - 传感器：MPU6500 I2C，地址 `0x68`
 - 物理引擎：自写，1-bit 离散世界，无需浮点库
@@ -73,4 +74,5 @@
 | `硬件接线.md` | 接线、引脚分配、上电检查 |
 | `PCB/` | 立创EDA 专业版工程（`.epro2`）与导出的 Gerber 包 |
 | `面板Logo/` | 前面板铭牌 Logo 的源图与导出件，含总览 SVG、铜箔层与丝印层的分层文件 |
+| `firmware/` | 板级上电自检草图（Arduino），一次验点阵、I2C 总线、串口与五路输入 |
 | `tools/` | 工程包解析、网表导出与元器件清单脚本，无第三方依赖 |

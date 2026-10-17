@@ -1,0 +1,25 @@
+# Gewu 正式固件的构建配置（arduino-cli 的 sketch project file，必须与 .ino 同目录且就叫这个名字）。
+#
+# 用法：`arduino-cli compile firmware/Gewu` —— default_profile 会让裸编译自动走下面的 profile 构建，
+# 平台与库都按钉住的版本自动拉取。换机器时不需要先在板管理器里填 Espressif 的 URL、也不需要预装任何库。
+#
+# profile 构建与系统已装的平台/库是隔离的，只认这里列的东西，所以本地装过什么版本都不影响结果。
+# 内容与 Hardware_Test/sketch.yaml 同源，只改了 profile 名与说明；版本号一个字没动。
+
+profiles:
+  gewu-firmware:
+    notes: 正式固件。格子锚定物理内核 + 编码器增删粒子 + MPU6500 实时重力。目标 AirM2M CORE ESP32C3 经典版（走板载 CH343，故 CDCOnBoot=Disabled）
+    fqbn: esp32:esp32:AirM2M_CORE_ESP32C3:CDCOnBoot=default
+    platforms:
+      # platform_index_url 必须写在这里：否则新机器上得先在板管理器加 Espressif 的索引才能解析 esp32:esp32
+      - platform: esp32:esp32 (3.3.12)
+        platform_index_url: https://espressif.github.io/arduino-esp32/package_esp32_index.json
+    libraries:
+      # IMU 仍然用 Wire 直接读写寄存器，不引入 Adafruit MPU6050——它的 begin() 对 WHO_AM_I 是硬比较，而本板实测是 0x70（MPU6500）。
+      - MD_MAX72XX (3.5.1)
+
+default_profile: gewu-firmware
+
+# 让 `arduino-cli monitor` 不用带参数就能按草图里的波特率打开
+default_port_config:
+  baudrate: 921600

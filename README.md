@@ -96,6 +96,6 @@
 | `PCB/` | 立创EDA 专业版工程（`.epro2`）与导出的 Gerber 包 |
 | `面板Logo/` | 前面板铭牌 Logo 的源图与导出件，含总览 SVG、铜箔层与丝印层的分层文件 |
 | `firmware/` | 板级上电自检草图（Arduino），一次验点阵、I2C 总线、串口与五路输入；另带一路串口命令，可点名点灯、全亮查死点、逐行逐列扫、运行时调亮度。逻辑坐标用数学系 `(x, y)`，原点左下。IMU 读数已按标定修正，`g` 命令进重力模式，把屏幕系的重力方向画成一颗灯 |
-| `firmware/Gewu/` | 正式固件：移植后的格子锚定物理内核 + 编码器增删粒子 + MPU6500 实时重力与三轴角速度（200 Hz 采样、±4 g、218 Hz 加速度计 DLPF）。顺时针一格随机添加一个粒子，逆时针一格删除最新添加的粒子，容量 64。串口命令 `n / d / p x y / c / i / f / u / g / w / s / k / v`，`f` / `u` 现场调板面与块间摩擦，`g` 调重力标度，`w` 调转速增益，`v plain\|friction\|spin` 生成与 `sim/port_trace.py` 对照的确定性 trace。构建上传：`arduino-cli compile -u -p COM11 -m gewu-firmware firmware/Gewu` |
+| `firmware/Gewu/` | 正式固件：移植后的格子锚定物理内核 + 编码器增删粒子 + MPU6500 实时重力与三轴角速度（200 Hz 采样、±4 g、218 Hz 加速度计 DLPF）。顺时针一格随机添加一个粒子，逆时针一格删除最新添加的粒子，容量 64。SW3 进入慢速生成：清空全部粒子并立刻补一颗，之后每 60 秒加一颗，任意微动按下或编码器转动都会打断（周期可用 `t` 临时改）。串口命令 `n / d / p x y / c / i / f / u / g / w / t / s / k / v`，`f` / `u` 现场调板面与块间摩擦，`g` 调重力标度，`w` 调转速增益，`t` 调慢速生成周期，`v plain\|friction\|spin` 生成与 `sim/port_trace.py` 对照的确定性 trace。构建上传：`arduino-cli compile -u -p COM11 -m gewu-firmware firmware/Gewu` |
 | `firmware/common/` | `BoardProfile.h`：这台板子**实测出来**的档案——点阵模块型号、编码器每格跳变数、IMU 量程与九个标定常数。与「可调参数」刻意分成两处，见文件开头的分组规则。`fixed_q16.h`：Q16.16 定点原语，逐条对应 `sim/fixed.py`。`PhysicsWorld.h`：格子锚定物理内核的 C++ 逐位移植，header-only，不依赖 Arduino |
 | `tools/` | 两组脚本：工程包解析（`bom` / `netlist` / `epro_dump`，只用标准库），台面调试与标定（`serial_send` / `serial_console` / `imu_stat` / `accel_calib`，要 `pyserial`） |

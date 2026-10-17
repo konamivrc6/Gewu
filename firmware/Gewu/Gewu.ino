@@ -3,6 +3,7 @@
  * ========================================================
  *
  * 这一版接编码器与 MPU6500 两路输入：顺时针一格在随机空白格添加一个粒子，逆时针一格删除最新添加的粒子（上限 64）；加速度计给实时重力，陀螺给三轴角速度，粒子会因倾斜滑落、因甩板获得冲量、因转板受到离心/科氏/欧拉力。IMU 没就绪时退回“平放、无平面内重力、不转动”，屏幕保持静止。
+ * SW3 是演示用的慢速生成任务：按下清空全部粒子并立刻补一颗，之后每 60 秒加一颗；任意微动按下或编码器转过一格都会打断它。
  *
  * 物理内核在 ../common/PhysicsWorld.h，逐位移植自 sim/world2.py；定点原语在 ../common/fixed_q16.h。这个草图只做三件事：读传感器、把输入翻译成增删与转动、把格号画到点阵上。
  *
@@ -55,6 +56,10 @@ static const float    GYRO_WD_DEADBAND  = 0.5f;   // rad/s²，低通后仍低�
 static const uint8_t  SPIN_FAIL_LIMIT   = 3;      // 连续读失败约 15 ms 就停转，不保留旧转速
 static const uint32_t SUBSTEP_US      = 8333;     // 120 Hz 子步，1e6 / 120 的整数近似，误差 0.004%
 static const uint8_t  MAX_CATCHUP     = 4;        // 一次 loop 最多补 4 个子步，约 33 ms
+// 微动消抖。硬件已各配 4.7k 上拉与 100nF（硬件接线.md 5.5 / 6.3），软件只补一道 15 ms 稳定确认。
+static const uint32_t DEBOUNCE_MS     = 15;
+// SW3 慢速生成任务的默认周期。串口 t N 可临时改，重启回到这里。
+static const uint32_t DRIP_INTERVAL_MS = 60000;
 // 1 g 对应引擎的格/子步²。这是标度旋钮，不是标定常数；串口 g N 按 N/10000 现场改，例如 g 40 = 0.0040。
 static const double   GRAVITY_PER_G_INIT = 0.0040;
 static double         gravityPerG        = GRAVITY_PER_G_INIT;
@@ -152,6 +157,29 @@ static const int8_t ENC_TABLE[16] = {
 static int8_t  encPrev  = 0;
 static int8_t  encAccum = 0;
 static int32_t encDetent = 0;
+
+// 三路微动的消抖状态。低电平有效，按下沿才动作；松开沿不报，免得串口刷屏。
+struct ButtonState {
+  uint8_t     pin;
+  const char *tag;
+  bool        stable;      // 已确认的稳定状态，true = 按下
+  bool        lastRaw;     // 上次读到的原始状态
+  uint32_t    lastEdgeMs;  // 原始状态上次变化的时间
+};
+
+static ButtonState buttons[] = {
+  { PIN_SW2,   "[SW2]",   false, false, 0 },
+  { PIN_SW3,   "[SW3]",   false, false, 0 },
+  { PIN_ENCSW, "[ENCSW]", false, false, 0 },
+};
+static const uint8_t BUTTON_COUNT = sizeof(buttons) / sizeof(buttons[0]);
+
+// SW3 慢速生成任务。按下清空全部粒子并立刻补一颗，之后每 dripIntervalMs 加一颗；
+// 任意微动按下或编码器转过一格都会终止它。串口命令不打断，方便台面调参时让它继续跑。
+static uint32_t dripIntervalMs = DRIP_INTERVAL_MS;
+static bool     dripActive  = false;
+static uint32_t dripNextMs  = 0;
+static uint16_t dripAdded   = 0;
 
 // ============================ 小工具 ============================
 
@@ -575,9 +603,81 @@ static void tickPhysics() {
   if (frameDone) renderWorld(false);
 }
 
+// ============================ SW3 慢速生成 ============================
+
+static void stopDrip(const char *why) {
+  if (!dripActive) return;
+  dripActive = false;
+  char buf[40];
+  snprintf(buf, sizeof(buf), "stop %s n=%u", why, (unsigned)world.count());
+  eventLine("[DRIP]", buf);
+}
+
+// 加一颗并报位置。满 64 颗（addRandom 返回 −1）就结束任务，不每分钟空转。
+static bool dripAddOne() {
+  const int16_t idx = world.addRandom();
+  if (idx < 0) {
+    stopDrip("full");
+    return false;
+  }
+  dripAdded++;
+  const gw::Block &b = world.block((uint8_t)idx);
+  char buf[40];
+  snprintf(buf, sizeof(buf), "add (%d,%d) n=%u", (int)b.cx, 7 - (int)b.cy, (unsigned)world.count());
+  eventLine("[DRIP]", buf);
+  return true;
+}
+
+// 按下 SW3：清空、立刻补一颗、重置计时。任务进行中再按等于重开，所以先停旧的任务。
+static void startDrip(uint32_t nowMs) {
+  if (dripActive) stopDrip("restart");
+  world.clear();
+  dripActive = true;
+  dripNextMs = nowMs + dripIntervalMs;
+  dripAdded = 0;
+  char buf[48];
+  snprintf(buf, sizeof(buf), "start next=%lus", (unsigned long)(dripIntervalMs / 1000));
+  eventLine("[DRIP]", buf);
+  dripAddOne();
+  renderWorld(true);
+}
+
+static void tickDrip(uint32_t nowMs) {
+  if (!dripActive) return;
+  if ((int32_t)(nowMs - dripNextMs) < 0) return;
+  // 下一个点从“现在”重算而不是累加：k 这类阻塞命令会让 loop 停几秒，
+  // 累加的话恢复后会连补好几颗；重算保证一次最多补一颗。
+  dripNextMs = nowMs + dripIntervalMs;
+  if (dripAddOne()) renderWorld(true);
+}
+
+// ============================ 微动 ============================
+
+static void scanButtons(uint32_t nowMs) {
+  for (uint8_t i = 0; i < BUTTON_COUNT; i++) {
+    ButtonState &b = buttons[i];
+    const bool raw = (digitalRead(b.pin) == LOW);   // 低电平有效
+
+    if (raw != b.lastRaw) {
+      b.lastRaw = raw;
+      b.lastEdgeMs = nowMs;
+      continue;                                     // 刚变化，先等它稳下来
+    }
+    if (raw == b.stable || (nowMs - b.lastEdgeMs) < DEBOUNCE_MS) continue;
+
+    b.stable = raw;
+    if (!raw) continue;                             // 只处理按下沿
+
+    eventLine(b.tag, "press");
+    if (b.pin == PIN_SW3) startDrip(nowMs);
+    else                  stopDrip("key");          // SW2 / ENCSW 只负责打断
+  }
+}
+
 // ============================ 编码器 ============================
 
 static void handleDetent(int8_t rawDir) {
+  stopDrip("encoder");   // 手动转了编码器，就不再让定时任务继续加粒子
   const int8_t dir = (int8_t)(rawDir * ENCODER_SIGN);
   char buf[40];
 
@@ -668,6 +768,7 @@ static void printHelp() {
   Serial.println(F("  u [0-99]        设块-块 / 块-墙摩擦 μ（百分之几）；不带参数报当前值"));
   Serial.println(F("  g [1-99]        设重力标度（万分之一，例如 g 40 = 0.0040）；不带参数报当前值"));
   Serial.println(F("  w [0-400]       设转速增益（百分数，例如 w 150；0 等于停转）；不带参数报当前值"));
+  Serial.println(F("  t [1-3600]      设 SW3 慢速生成周期（秒，默认 60，重启恢复）；不带参数报当前值"));
   Serial.println(F("  s               打印状态、统计与不变量"));
   Serial.println(F("  k N             同步推进 N 帧（台面测试用，会阻塞输入）"));
   Serial.println(F("  v plain|friction|spin [帧数]   确定性 trace，与 sim/port_trace.py 逐行对照"));
@@ -675,6 +776,7 @@ static void printHelp() {
   Serial.printf("当前：n=%u  mode=particles  intensity=%u  seed=%lu\n",
                 (unsigned)world.count(), (unsigned)mxIntensity, (unsigned long)world.seed());
   Serial.println(F("顺时针转编码器 = 添加，逆时针 = 删除。方向反了就改 Gewu.ino 顶部的 ENCODER_SIGN。"));
+  Serial.println(F("SW3 = 清空全部粒子并立刻补一颗，之后按周期加一颗；任意微动按下或编码器转动都会打断。"));
 }
 
 static void printStatus() {
@@ -706,10 +808,14 @@ static void printStatus() {
                 lastWdx, lastWdy, lastWdz,
                 (unsigned long)spinUpdates, (unsigned)spinFailCount,
                 (unsigned long)spinRejects);
+  const int32_t dripNextSec = dripActive ? (int32_t)(dripNextMs - millis()) / 1000 : 0;
   Serial.printf("[STA] seed=%lu detent=%ld drops=%lu loopmax_us=%lu frame_hz=%.2f substeps=%u\n",
                 (unsigned long)world.seed(), (long)encDetent, (unsigned long)droppedSubsteps,
                 (unsigned long)loopMaxUs, p.substepHz / (double)p.substeps,
                 (unsigned)p.substeps);
+  Serial.printf("[STA] drip=%s next=%lds added=%u interval=%lus\n",
+                dripActive ? "on" : "off", (long)dripNextSec,
+                (unsigned)dripAdded, (unsigned long)(dripIntervalMs / 1000));
 }
 
 static void traceHeader(const char *kind, uint32_t frames) {
@@ -896,6 +1002,22 @@ static void runCommand(char *line) {
       }
       break;
 
+    case 't':
+      if (nw > 2) { ackErr("err t N"); return; }
+      if (nw == 2) {
+        uint32_t v = 0;
+        if (!parseU32(w[1], 3600, &v) || v == 0) { ackErr("err t 1..3600"); return; }
+        dripIntervalMs = v * 1000UL;
+        // 任务进行中改周期，按新周期重排下一个点，免得旧的长周期还压着。
+        if (dripActive) dripNextMs = millis() + dripIntervalMs;
+      }
+      {
+        char buf[24];
+        snprintf(buf, sizeof(buf), "t %lus", (unsigned long)(dripIntervalMs / 1000));
+        eventLine("[CMD]", buf);
+      }
+      break;
+
     case 's':
       if (nw != 1) { ackErr("err s"); return; }
       printStatus();
@@ -982,6 +1104,7 @@ void setup() {
   Serial.println(F(" 引擎 v2 格子锚定 / Q16.16 定点 / 8x8 / 容量 64"));
   Serial.println(F(" 物理 120 子步每秒 x 2 = 60 帧每秒"));
   Serial.println(F(" 顺时针转编码器 = 添加粒子，逆时针 = 删除最新"));
+  Serial.println(F(" SW3 = 清空后每 60 秒加一颗，任意微动 / 编码器转动打断"));
   Serial.println(F(" 命令：? 看清单（n 加 / d 删 / p x y 定点添加 / c 清空 / f u 摩擦 / g 重力 / w 转速增益 / s 状态 / v trace）"));
   Serial.println(F("========================================"));
 
@@ -1028,6 +1151,7 @@ void setup() {
   Serial.printf("物理内核就绪：容量 %u，初始粒子 0，种子 %lu\n",
                 (unsigned)gw::PhysicsWorld::MAX_BLOCKS, (unsigned long)world.seed());
   Serial.println(F("开始：转编码器添加或删除粒子；倾斜朝低处滑，横向甩板有冲量，转板受离心力。"));
+  Serial.println(F("按 SW3 进入慢速生成：清空后立刻补一颗，之后每 60 秒加一颗；任意微动或编码器转动打断。"));
   Serial.println();
 }
 
@@ -1038,7 +1162,9 @@ void loop() {
   const uint32_t nowMs = millis();
 
   pollSerial();          // 永不阻塞；命令响应越快越顺手
+  scanButtons(nowMs);    // 微动：SW3 启动慢速生成，SW2 / ENCSW 打断
   scanEncoder();         // 每轮都扫，不按模式门控
+  tickDrip(nowMs);       // SW3 任务的定时加粒子
   tickImu(nowMs);        // 200 Hz 更新重力
   tickPhysics();         // 120 Hz 子步，每 2 个子步渲染一帧
 

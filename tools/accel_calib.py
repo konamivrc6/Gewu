@@ -18,8 +18,7 @@ status：看还缺哪几个姿态。
   python tools/accel_calib.py status
   python tools/accel_calib.py solve
 
-依赖 pyserial。姿态数据落在 %TEMP%\\gewu_poses.json，原始数据行落在 %TEMP%\\gewu_imu.log，
-都不进仓库。换板、换模块、改安装朝向后要重跑六个姿态——求解出的常数是这份硬件独有的。
+依赖 pyserial。不指定 `--port` 时按 VID/PID 自动找格物的 CH343，找不到或有多个候选会列出清单让你指定。姿态数据落在 %TEMP%\\gewu_poses.json，原始数据行落在 %TEMP%\\gewu_imu.log，都不进仓库。换板、换模块、改安装朝向后要重跑六个姿态——求解出的常数是这份硬件独有的。
 """
 import argparse
 import json
@@ -31,6 +30,8 @@ import tempfile
 import time
 
 import serial
+
+from serial_port import PortNotFound, pick_port
 
 TMP = tempfile.gettempdir()
 STORE = os.path.join(TMP, "gewu_poses.json")
@@ -138,7 +139,13 @@ def do_record(args) -> None:
     out(f"姿态 {args.pose}：{label}\n  构造上世界「上」应为模组 "
         f"({expected[0]:+.0f}, {expected[1]:+.0f}, {expected[2]:+.0f})\n\n")
 
-    rows = sample(args.port, args.sec, args.reset)
+    try:
+        port = pick_port(args.port)
+    except PortNotFound as exc:
+        out(f"{exc}\n")
+        return
+
+    rows = sample(port, args.sec, args.reset)
     if not rows:
         out("没收到数据——板子在跑吗？\n")
         return
@@ -266,7 +273,7 @@ def main() -> None:
     r = sub.add_parser("record", help="采样一个姿态")
     r.add_argument("--pose", required=True, choices=sorted(POSES))
     r.add_argument("--sec", type=float, default=15.0)
-    r.add_argument("--port", default="COM11")
+    r.add_argument("--port", default=None, help="串口，例如 COM7；不给就自动找 CH343")
     r.add_argument("--reset", action="store_true")
     r.set_defaults(func=do_record)
 

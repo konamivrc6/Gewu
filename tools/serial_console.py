@@ -1,12 +1,12 @@
 """交互式串口控制台。
 
-和 `serial_send.py` 的一次性发命令不同，这里是一个常驻的提示符，一行一条命令，边敲边看回显。串口默认 921600、`COM11`，与仓库里其它台面脚本一致。
+和 `serial_send.py` 的一次性发命令不同，这里是一个常驻的提示符，一行一条命令，边敲边看回显。串口默认 921600；不指定 `--port` 时按 VID/PID 自动找格物的 CH343，找不到或有多个候选会列出清单让你指定。
 
 本地命令以冒号开头，不会发给固件：
 
     :help            本地命令清单
     :reset           拉 RTS 复位，等开机横幅
-    :port COM7       换串口（别名为 :com，也可以写 :com 7）（别名为 :com，也可以写 :com 7；不带参数报当前值）
+    :port COM7       换串口（别名为 :com，也可以写 :com 7；不带参数报当前值）
     :filter          开关 `MPU6` 数据行过滤（默认开，给 Hardware_Test 用）
     :log             打印原始日志路径
     :quit / :q       退出，Ctrl-D 也可以
@@ -33,6 +33,8 @@ import tempfile
 import time
 
 import serial
+
+from serial_port import PortNotFound, pick_port
 
 LOG_PATH = os.path.join(tempfile.gettempdir(), "gewu_console.log")
 
@@ -262,7 +264,7 @@ class Console:
 def main(argv: list[str] | None = None) -> int:
     use_utf8()
     ap = argparse.ArgumentParser(description="交互式串口控制台")
-    ap.add_argument("--port", default="COM11")
+    ap.add_argument("--port", default=None, help="串口，例如 COM7；不给就自动找 CH343")
     ap.add_argument("--baud", type=int, default=921600)
     ap.add_argument("--reset", action="store_true", help="连上后先复位并等开机横幅")
     ap.add_argument("--quiet", type=float, default=0.12,
@@ -272,12 +274,18 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-color", action="store_true")
     args = ap.parse_args(argv)
 
+    try:
+        port = pick_port(args.port)
+    except PortNotFound as exc:
+        out(f"[host] {exc}\n")
+        return 1
+
     color = not args.no_color and enable_ansi()
     try:
-        con = Console(args.port, args.baud, color, args.quiet, args.limit,
+        con = Console(port, args.baud, color, args.quiet, args.limit,
                       not args.no_filter)
     except Exception as exc:  # noqa: BLE001
-        out(f"[host] 打不开 {args.port}：{exc}\n（串口监视器是不是还开着？）\n")
+        out(f"[host] 打不开 {port}：{exc}\n（串口监视器是不是还开着？）\n")
         return 1
 
     try:

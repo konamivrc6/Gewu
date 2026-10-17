@@ -11,7 +11,7 @@
   python tools/serial_send.py --reset '?'
   python tools/serial_send.py 'p 3 5' --port COM7 --wait 0.8
 
-依赖 pyserial。原始回显写到 %TEMP%\\gewu_send.log（不进仓库）。
+依赖 pyserial。不指定 `--port` 时按 VID/PID 自动找格物的 CH343，找不到或有多个候选会列出清单让你指定。原始回显写到 %TEMP%\\gewu_send.log（不进仓库）。
 """
 import argparse
 import os
@@ -20,6 +20,8 @@ import tempfile
 import time
 
 import serial
+
+from serial_port import PortNotFound, pick_port
 
 LOG_PATH = os.path.join(tempfile.gettempdir(), "gewu_send.log")
 
@@ -78,15 +80,21 @@ def reset_and_wait_banner(s: serial.Serial) -> bool:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("cmds", nargs="+", help="逐条发送，不带行尾（脚本自己补 \\r\\n）")
-    ap.add_argument("--port", default="COM11")
+    ap.add_argument("--port", default=None, help="串口，例如 COM7；不给就自动找 CH343")
     ap.add_argument("--reset", action="store_true", help="先复位并等开机横幅")
     ap.add_argument("--wait", type=float, default=0.4, help="每条命令后收多久")
     args = ap.parse_args()
 
     try:
-        s = serial.Serial(port=args.port, baudrate=921600, timeout=0.1)
+        port = pick_port(args.port)
+    except PortNotFound as exc:
+        out(f"{exc}\n")
+        return
+
+    try:
+        s = serial.Serial(port=port, baudrate=921600, timeout=0.1)
     except Exception as exc:  # noqa: BLE001
-        out(f"打不开 {args.port}：{exc}\n（串口监视器是不是还开着？）\n")
+        out(f"打不开 {port}：{exc}\n（串口监视器是不是还开着？）\n")
         return
 
     with s:

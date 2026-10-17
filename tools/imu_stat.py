@@ -13,7 +13,7 @@
   python tools/imu_stat.py --sec 12 --label '点阵面朝上平放'
   python tools/imu_stat.py --sec 60 --port COM7
 
-依赖 pyserial。原始数据行写到 %TEMP%\\gewu_imu.log（不进仓库）。
+依赖 pyserial。不指定 `--port` 时按 VID/PID 自动找格物的 CH343，找不到或有多个候选会列出清单让你指定。原始数据行写到 %TEMP%\\gewu_imu.log（不进仓库）。
 """
 import argparse
 import math
@@ -24,6 +24,8 @@ import tempfile
 import time
 
 import serial
+
+from serial_port import PortNotFound, pick_port
 
 RAWLOG = os.path.join(tempfile.gettempdir(), "gewu_imu.log")
 
@@ -60,15 +62,21 @@ def sgn(v: float, fmt: str = "+.4f") -> str:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--sec", type=float, default=8.0, help="采多久（默认 8 秒）")
-    ap.add_argument("--port", default="COM11")
+    ap.add_argument("--port", default=None, help="串口，例如 COM7；不给就自动找 CH343")
     ap.add_argument("--label", default="", help="这个姿态的名字，只用于回显")
     ap.add_argument("--reset", action="store_true", help="先复位并等开机横幅")
     args = ap.parse_args()
 
     try:
-        s = serial.Serial(port=args.port, baudrate=921600, timeout=0.1)
+        port = pick_port(args.port)
+    except PortNotFound as exc:
+        out(f"{exc}\n")
+        return
+
+    try:
+        s = serial.Serial(port=port, baudrate=921600, timeout=0.1)
     except Exception as exc:  # noqa: BLE001
-        out(f"打不开 {args.port}：{exc}\n（串口监视器是不是还开着？）\n")
+        out(f"打不开 {port}：{exc}\n（串口监视器是不是还开着？）\n")
         return
 
     rows = []

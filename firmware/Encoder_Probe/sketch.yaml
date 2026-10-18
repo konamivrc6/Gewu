@@ -1,0 +1,20 @@
+# 格物编码器探针的构建配置（临时诊断草图）。
+#
+# 与正式固件同一平台、同一板型、同一波特率；不依赖任何库——本草图连点阵都不初始化，
+# 就是为了把「显示 / IMU / 物理内核」全部从故障面里摘出去。
+#
+# 用法：arduino-cli compile firmware/Encoder_Probe
+# 烧录：arduino-cli upload -p COM7 --fqbn esp32:esp32:AirM2M_CORE_ESP32C3:CDCOnBoot=default firmware/Encoder_Probe
+
+profiles:
+  gewu-enc-probe:
+    notes: 编码器探针。只读 A / B / 按压三根线，打印电平、电压、边沿与正交解码结果
+    fqbn: esp32:esp32:AirM2M_CORE_ESP32C3:CDCOnBoot=default
+    platforms:
+      - platform: esp32:esp32 (3.3.12)
+        platform_index_url: https://espressif.github.io/arduino-esp32/package_esp32_index.json
+
+default_profile: gewu-enc-probe
+
+default_port_config:
+  baudrate: 921600

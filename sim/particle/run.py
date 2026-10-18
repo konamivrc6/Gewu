@@ -1,13 +1,13 @@
 """物块模式仿真入口。
 
-    python sim/run.py                      # 默认 v2（格子锚定），终端里实时播
-    python sim/run.py --engine v1          # 跑基线：硬球 + 事后修补
-    python sim/run.py --frames 600 --n 20  # 多放几个，看看挤不挤
-    python sim/run.py --sweep              # 重力方向来回扫，看堆积会不会跟着倒
-    python sim/run.py --scene full         # 全盘随机摆位
-    python sim/run.py --scene center --n 16 --gravity 0 --spin-rps 0.5   # 平放、绕板心转，料甩向四角
-    python sim/run.py --dump frames.json   # 导出帧序列
-    python sim/run.py --interactive        # 方向键实时倾斜（Windows）
+    python sim/particle/run.py                      # 默认 v2（格子锚定），终端里实时播
+    python sim/particle/run.py --engine v1          # 跑基线：硬球 + 事后修补
+    python sim/particle/run.py --frames 600 --n 20  # 多放几个，看看挤不挤
+    python sim/particle/run.py --sweep              # 重力方向来回扫，看堆积会不会跟着倒
+    python sim/particle/run.py --scene full         # 全盘随机摆位
+    python sim/particle/run.py --scene center --n 16 --gravity 0 --spin-rps 0.5   # 平放、绕板心转，料甩向四角
+    python sim/particle/run.py --dump frames.json   # 导出帧序列
+    python sim/particle/run.py --interactive        # 方向键实时倾斜（Windows）
 
 两个引擎的场景名共用 `spawn.py`，同一个 `--scene` 在两边给出同一份格号列表——否则 A/B 对比里会混进"初始条件不同"这一项。
 
@@ -19,8 +19,12 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sys
 import time
+
+# 脚本住在 sim/particle/，公共模块（fixed / spawn）在上一层，先把它加进搜索路径。
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import checker
 import spawn as spawn_mod

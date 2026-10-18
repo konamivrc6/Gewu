@@ -11,11 +11,11 @@
 
 用法：
 
-    python sim/aniso.py                          # μ = 0.55，0~90 度，1 度步长，轴序 vel
-    python sim/aniso.py --friction 0.3 0.55 0.8  # 摩擦对照：真实雪崩阈值会跟着 μ 走
-    python sim/aniso.py --axis-order xy          # 对照：固定先 x 后 y，残差会回来
-    python sim/aniso.py --step 5 --csv aniso.csv
-    python sim/aniso.py --table-every 0          # 只看摘要
+    python sim/particle/aniso.py                          # μ = 0.55，0~90 度，1 度步长，轴序 vel
+    python sim/particle/aniso.py --friction 0.3 0.55 0.8  # 摩擦对照：真实雪崩阈值会跟着 μ 走
+    python sim/particle/aniso.py --axis-order xy          # 对照：固定先 x 后 y，残差会回来
+    python sim/particle/aniso.py --step 5 --csv aniso.csv
+    python sim/particle/aniso.py --table-every 0          # 只看摘要
 """
 
 from __future__ import annotations
@@ -23,8 +23,12 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import os
 import sys
 import time
+
+# 脚本住在 sim/particle/，公共模块（fixed / spawn）在上一层，先把它加进搜索路径。
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import checker
 import world2 as V2

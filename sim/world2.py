@@ -22,7 +22,7 @@
 
 转动原点是**加速度计**，不是板心。加速度计读的是 `a_spec = a_原点 − g`，而惯性系里 `a_块 = a_原点 + Ω×(Ω×r) + Ω̇×r + 2Ω×v + a_相对`；消掉 `a_原点` 之后，剩下的正好是 `−a_spec` 加上那三个伪力。原点因此自动落在加速度计上——**不需要知道手在绕哪一点转**。板子绕桌角转、绕腕关节转、平放在桌上原地拧，同一套式子都成立；加速度计偏心带来的那份离心读数并不是误差，它正是把原点从板心搬到加速度计的那一项。模拟里 `pivot` 就是"加速度计落在哪一格"，默认板心。
 
-三个伪力里离心是 Ω 的偶函数，科氏与欧拉是奇函数。所以把世界转置（x↔y）并把 **Ω 这个赝矢量整体取反**（`Ω' = (−Ωy, −Ωx, −Ωz)`），解应当仍然互为转置——`sim/rot.py` 的镜像检验就靠这条。
+三个伪力里离心是 Ω 的偶函数，科氏与欧拉是奇函数。所以把世界转置（x↔y）并把 **Ω 这个赝矢量整体取反**（`Ω' = (−Ωy, −Ωx, −Ωz)`），解应当仍然互为转置——`sim/particle/rot.py` 的镜像检验就靠这条。
 
 **板面摩擦**：块躺在底板上，法向压力由总重力与平面内分量之差给出：
 
@@ -39,18 +39,40 @@
 
 只有一个系数，μ_s = μ_k。真实材料的静摩擦系数通常比动摩擦高 10%~50%，这里不区分；要分就得再加一个参数和一条"是否从零起滑"的分支。
 
-板面摩擦是**耗散**项，`sim/rot.py` 里那条"g = 0 时力的比值与转速无关"只在 `plate_friction = 0` 时成立。开着摩擦时离心力随 ω² 长、摩擦力不随 ω 变，于是存在一个临界转速：低于它块被静摩擦钉住，高于它才甩得动。
+板面摩擦是**耗散**项，`sim/particle/rot.py` 里那条"g = 0 时力的比值与转速无关"只在 `plate_friction = 0` 时成立。开着摩擦时离心力随 ω² 长、摩擦力不随 ω 变，于是存在一个临界转速：低于它块被静摩擦钉住，高于它才甩得动。
 
 **表示不了的东西**：块被约束在平面内，所有垂直纸面的加速度都记在底板支持力上，不能为负。快速翻板时 `−2Ω×v` 与 `−Ω̇×r` 的垂直分量可能超过重力，块会真的离开板面——那是三维运动，这个二维模型没有状态可以放它。转动产生的离面分量也没有计入 N：平放绕法线转时它们为零，绕平面内的轴转时会让一部分块压得更紧、另一部分松脱，这里一律按压紧处理。
+
+**水模式（可选）**：`Params.cohesion` 打开八邻域内聚力，`cohesion_damping` 是沿键轴的相对速度阻尼，`wetting` 是接触线力，`wall_adhesion` 是壁面虚拟格的法向吸附。四个量默认全 0，粒子模式的路径逐位不变。方向只取格偏移而不取连续位置：八邻域全满时向量和为零，净力只出现在边界，体内没有剪切刚度。一格一颗保证不可压缩，所以内聚力只负责液-气界面的收缩，不需要密度与压力求解。原型与实验在 `sim/water/water.py`。
+
+**静水压强（`Params.hydrostatic`）**：内聚力只让液-气界面收缩，它不传递竖直方向上的重量，所以一根竖立的水柱在格点模型里是完全平衡的——下面的粒子各自被下面一格挡住，上面那份重量没有任何通道变成横向推力。真实液体里这份重量就是压强：`p = ρ g h`，两个相邻液柱的底面压强差会把水从高柱推向低柱。这里把这一项显式补上：每格沿**真实重力反方向**（不是量化到格轴）以半格步长射线前进，找到最后一个还有水的采样点，再用射线穿过最后一格边界的位置把水头插值成连续值；然后对四邻域的水头做中心差分，扣掉沿重力分量，只保留垂直分量作为横向加速度，系数与 `g∥` 成正比。重力方向全程连续，手上慢慢转板子时力的方向不会跳。两侧都是自由面且水头相等时是个真正的对称简并（真实液体靠热涨落破缺），这里按确定性规则朝板心一侧倒，保证左右镜像等变、trace 可复现。重力为零时这一项恒为零，零重力水珠仍只由内聚力决定。
 """
 
 from __future__ import annotations
 
 import math
+import os
+import sys
+
+# 内核住在 sim/，定点原语与摆位在同一层；粒子脚本在 sim/particle/ 时会把这个目录加进路径。
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import checker
 import spawn
 from fixed import ONE, add, div, hypot, mul, mul_sq, neg, sub, to_float, from_float, clamp, cell, halve
+
+# 八邻域扫描顺序固定：dy 外层、dx 内层，跳过 (0,0)。Python 与 C++ 必须逐项一致，否则定点加法的求和顺序变了，逐位 trace 就对不上。
+# 每项是 (dx, dy, ux, uy, 是否对角)。ux/uy 是格偏移的单位向量，对角分量为 1/√2 ≈ 46341/65536。
+_COH_OFFSETS = (
+    (-1, -1, -46341, -46341, True),
+    (0, -1, 0, -ONE, False),
+    (1, -1, 46341, -46341, True),
+    (-1, 0, -ONE, 0, False),
+    (1, 0, ONE, 0, False),
+    (-1, 1, -46341, 46341, True),
+    (0, 1, 0, ONE, False),
+    (1, 1, 46341, 46341, True),
+)
 
 
 class Params:
@@ -66,11 +88,21 @@ class Params:
         self.friction = 0.55            # 块-块与块-墙的库仑系数 μ，等于休止角的正切
         self.damping = 0.9995
         self.vmax = 0.6                 # 格 / 子步。必须 < 1，见 __init__ 的检查
-        self.substeps = 2
-        self.substep_hz = 120.0         # 每秒子步数。只用来把 转/秒 换算成 弧度/子步；固件按 60 Hz 帧 × 2 子步对表
+        self.substeps = 4               # 每帧子步数。与固件的 setup() 对齐，改这里就是改默认的时间尺度
+        self.substep_hz = 240.0         # 每秒子步数。只用来把 转/秒 换算成 弧度/子步；240 / 4 = 60 Hz 帧率
+        # 例外：sim/particle/port_trace.py 与 sim/water/port_trace.py 显式传 2 / 120，那是固件 v 命令的逐位基准，
+        # 固件的 traceWorld 用的是 PhysicsWorld::Params 的默认值（2 / 120），两边必须一起留在原地。
         self.pivot = (4.0, 4.0)         # 加速度计在格坐标里的位置，也就是转动的原点。默认板心
         self.gate_order = "pen"         # "pen" = 离格心最远的先过门
         self.axis_order = "vel"         # "vel"（先过速度大的轴，转置等变）/ "xy" / "yx" / "alt"（隔子步换）
+        # 水模式。四个量默认全 0，粒子模式的路径必须逐位不变。
+        self.cohesion = 0.0             # 相邻格之间的内聚加速度，格/子步²。轴向键的强度
+        self.cohesion_diag = 0.5        # 对角键相对轴向的权重，0 = 只用四邻域，1 = 与轴向等强
+        self.cohesion_damping = 0.0     # 沿键轴的相对速度阻尼，0..1。等效黏性，压住内聚力的振铃
+        self.wetting = 0.0              # 接触线力强度，相对 cohesion。≈ cos θ，负值 = 疏水
+        self.wetting_gain = 1.0         # 接触线力增益。格点模型缺了连续介质的集体压力，1 往往推不动接触线
+        self.wall_adhesion = 0.0        # 壁面虚拟水格的法向吸附强度，相对 cohesion。高值会把水横向压向中间，先默认关
+        self.hydrostatic = 0.0          # 静水压强增益，0 = 关闭。横向加速度 = gain · g∥ · 两侧水柱的深度差
         for k, v in kw.items():
             setattr(self, k, v)
 
@@ -106,6 +138,42 @@ class World2:
         self.damp = from_float(params.damping)
         self.vmax = from_float(params.vmax)
         self.eps = from_float(1e-4)
+        # 内聚力的预计算。cohesion 默认 0 时这些向量全为零，substep 里整段跳过，粒子 trace 不受影响。
+        if not (0.0 <= params.cohesion_diag <= 1.0):
+            raise ValueError(f"cohesion_diag 必须在 [0, 1] 内，收到 {params.cohesion_diag}")
+        if not (0.0 <= params.cohesion_damping <= 1.0):
+            raise ValueError(f"cohesion_damping 必须在 [0, 1] 内，收到 {params.cohesion_damping}")
+        if params.cohesion < 0.0:
+            raise ValueError(f"cohesion 不能为负，收到 {params.cohesion}")
+        if params.hydrostatic < 0.0:
+            raise ValueError(f"hydrostatic 不能为负，收到 {params.hydrostatic}")
+        self.aco = from_float(params.cohesion)
+        self.acod = from_float(params.cohesion * params.cohesion_diag)
+        self.cdamp = from_float(params.cohesion_damping)
+        self.wet = from_float(params.wetting)
+        self.wline = from_float(params.wetting_gain)
+        # 接触线力：Young 方程里的 γ_sv − γ_sl。虚拟壁面格只给法向吸引，这条沿壁面的线力才是接触角的来源。
+        self.line_force = mul(mul(self.aco, self.wet), self.wline)
+        self.coh_force = []
+        self.wet_force = []
+        for _dx, _dy, _ux, _uy, _diag in _COH_OFFSETS:
+            _a = self.acod if _diag else self.aco
+            self.coh_force.append((mul(_a, _ux), mul(_a, _uy)))
+            _w = from_float(params.cohesion * (params.cohesion_diag if _diag else 1.0) * params.wall_adhesion)
+            self.wet_force.append((mul(_w, _ux), mul(_w, _uy)))
+        self.cohesion_on = (self.cdamp != 0 or self.line_force != 0 or
+                            any(v != (0, 0) for v in self.coh_force) or
+                            any(v != (0, 0) for v in self.wet_force))
+        # 静水压强的逐子步状态：真实重力单位向量、射线半格步长、水头表（半格计数）。
+        self.press = from_float(params.hydrostatic)
+        self.press_on = self.press != 0
+        self.press_active = False
+        self.press_kg = 0
+        self.press_ux = 0
+        self.press_uy = ONE
+        self.press_ray_x = 0
+        self.press_ray_y = -(ONE >> 1)
+        self.press_depth = [0] * (self.W * self.H)
         self.blocks = []
         self.owner = [-1] * (self.W * self.H)
         self.stats = {"commits": 0, "blocked": 0, "wall": 0}
@@ -183,7 +251,11 @@ class World2:
             twz = add(wz, wz)
             cross = mul(wx, wy)     # 离心交叉项系数 Ωx·Ωy
             pivx, pivy = self.pivx, self.pivy
-        for b in self.blocks:
+        # 内聚力与静水压强必须先用全体块的旧状态算完，再统一施加。若边算边改，先处理到的块会改掉邻居用于阻尼的速度，结果依赖块的存储顺序。
+        self._update_pressure(gx, gy)
+        extra = ([self._extra_accel(i) for i in range(len(self.blocks))]
+                 if (self.cohesion_on or self.press_active) else None)
+        for i, b in enumerate(self.blocks):
             if spin:
                 rx = sub(b.px, pivx)
                 ry = sub(b.py, pivy)
@@ -193,11 +265,18 @@ class World2:
                 # 科氏 +2Ωz(v_y, −v_x)；欧拉 +Ω̇z(r_y, −r_x)。Ωx、Ωy、Ω̇x、Ω̇y 的那部分垂直纸面，被支持力吃掉
                 ax = add(add(gx, cx), add(mul(twz, b.vy), mul(wdz, ry)))
                 ay = sub(add(gy, cy), add(mul(twz, b.vx), mul(wdz, rx)))
+                if extra is not None:
+                    ax = add(ax, extra[i][0])
+                    ay = add(ay, extra[i][1])
                 b.vx = clamp(mul(add(b.vx, ax), self.damp), -self.vmax, self.vmax)
                 b.vy = clamp(mul(add(b.vy, ay), self.damp), -self.vmax, self.vmax)
             else:
-                b.vx = clamp(mul(add(b.vx, gx), self.damp), -self.vmax, self.vmax)
-                b.vy = clamp(mul(add(b.vy, gy), self.damp), -self.vmax, self.vmax)
+                ax, ay = gx, gy
+                if extra is not None:
+                    ax = add(ax, extra[i][0])
+                    ay = add(ay, extra[i][1])
+                b.vx = clamp(mul(add(b.vx, ax), self.damp), -self.vmax, self.vmax)
+                b.vy = clamp(mul(add(b.vy, ay), self.damp), -self.vmax, self.vmax)
             # 板面摩擦在跨格门之前：它是体表力，和后面格子面上的法向冲量是两回事
             self._plate_friction(b)
             b.px = add(b.px, b.vx)
@@ -227,6 +306,204 @@ class World2:
                 axes = base_axes
             for ax in axes:
                 self._gate(i, ax)
+
+    def _cohesion(self, i: int):
+        """单块的内聚 + 浸润 + 键轴阻尼，返回本子步要施加的加速度（Q16.16）。
+
+        方向只取格偏移，不取粒子的连续位置。这是刻意的：八邻域全满时八个单位向量之和严格为零，所以净力只出现在边界；形变也不改变键的方向，体内因此没有剪切刚度。若改用连续位置归一化，水会获得弹性，容易变成一块会滑动的固体。
+
+        越界邻居当作虚拟水格，强度是 cohesion·wetting。平直壁面上三个虚拟格的切向分量相消，净力只剩法向；角上的合力指向角平分线。
+
+        阻尼沿键轴取相对速度，等大反作用于两端。每个粒子每子步会被最多八个邻居各阻尼一次，所以系数要取小值，0.02 量级已经很明显。
+        """
+        b = self.blocks[i]
+        own = self.owner
+        W, H = self.W, self.H
+        fx = 0
+        fy = 0
+        for (dx, dy, ux, uy, _diag), (cfx, cfy), (wfx, wfy) in zip(_COH_OFFSETS, self.coh_force, self.wet_force):
+            nx = b.cx + dx
+            ny = b.cy + dy
+            if 0 <= nx < W and 0 <= ny < H:
+                j = own[nx + ny * W]
+                if j < 0:
+                    continue
+                fx = add(fx, cfx)
+                fy = add(fy, cfy)
+                if self.cdamp != 0:
+                    o = self.blocks[j]
+                    vrel = add(mul(sub(b.vx, o.vx), ux), mul(sub(b.vy, o.vy), uy))
+                    d = mul(self.cdamp, vrel)
+                    fx = sub(fx, mul(d, ux))
+                    fy = sub(fy, mul(d, uy))
+            else:
+                fx = add(fx, wfx)
+                fy = add(fy, wfy)
+        lx, ly = self._contact_line(b)
+        return add(fx, lx), add(fy, ly)
+
+    def _is_water(self, x: int, y: int) -> bool:
+        return 0 <= x < self.W and 0 <= y < self.H and self.owner[x + y * self.W] >= 0
+
+    # ---------- 静水压强 ----------
+
+    def _update_pressure(self, gx: int, gy: int) -> None:
+        """每子步把重力方向归一化，再给每个水格沿 -ĝ 做一条半格步长的射线，得到真实水头。
+
+        射线方向是连续的，不再量化到八邻域；水头用半格计数（整数），所以定点热路径里只有加法和查表。重力为零时整项关闭，零重力水珠的行为不变。
+        水头表每子步重建一次：64 格 × 最多 24 步，和原来每格三次整数格行走同量级。
+        """
+        if not self.press_on:
+            self.press_active = False
+            return
+        gmag = hypot(gx, gy)
+        if gmag == 0:
+            self.press_active = False
+            return
+        self.press_ux = div(gx, gmag)
+        self.press_uy = div(gy, gmag)
+        self.press_ray_x = halve(neg(self.press_ux))
+        self.press_ray_y = halve(neg(self.press_uy))
+        # 水头现在是格，Q16.16，直接乘增益：kg = 增益 · g∥
+        self.press_kg = mul(self.press, gmag)
+        self.press_active = self.press_kg != 0
+        if self.press_active:
+            self._build_depth()
+
+    def _build_depth(self) -> None:
+        """沿真实重力反方向给每个水格算水头，单位是格，Q16.16；空格保持 0。
+
+        半格步进只负责找到「最后一个还有水的采样点」，真正的液面位置用射线穿过最后那格边界的位置做一次线性插值。这样水头随重力方向连续变化，不会在射线跨格时跳半格——这一步是手上转动时不出现台阶的关键。
+        """
+        depth = self.press_depth
+        for k in range(len(depth)):
+            depth[k] = 0
+        half = ONE >> 1
+        rx, ry = self.press_ray_x, self.press_ray_y
+        for b in self.blocks:
+            px = add(from_float(b.cx), half)
+            py = add(from_float(b.cy), half)
+            n = 0
+            for _ in range(24):
+                qx = add(px, rx)
+                qy = add(py, ry)
+                nx = cell(qx)
+                ny = cell(qy)
+                if not (0 <= nx < self.W and 0 <= ny < self.H):
+                    break
+                if self.owner[nx + ny * self.W] < 0:
+                    break
+                px, py = qx, qy
+                n += 1
+            # (px,py) 是最后一个仍有水的采样点；下一个采样点已经出格。求这一步走到格边的比例 f ∈ [0,1]。
+            ox, oy = cell(px), cell(py)
+            qx, qy = add(px, rx), add(py, ry)
+            cx, cy = cell(qx), cell(qy)
+            best_f = None
+            if cx != ox and rx != 0:
+                bx = from_float(ox + 1 if cx > ox else ox)
+                f = div(sub(bx, px), rx)
+                if f >= 0:
+                    best_f = f
+            if cy != oy and ry != 0:
+                by = from_float(oy + 1 if cy > oy else oy)
+                f = div(sub(by, py), ry)
+                if f >= 0 and (best_f is None or f < best_f):
+                    best_f = f
+            if best_f is None:
+                best_f = 0
+            nq = add(from_float(n), best_f)          # 半格计数，含小数
+            depth[b.cx + b.cy * self.W] = halve(sub(nq, ONE)) if nq > ONE else 0
+
+    def _pressure(self, i: int):
+        """单块的静水压强加速度：对水头表做中心差分，再扣掉沿重力分量。
+
+        `p = ρg·h` 的梯度里，沿重力那一半正好抵消重力，已经由接触与法向支撑处理；这里只施加垂直分量，避免重复抵消。
+        两侧都是自由面、水头也相等时是真正的对称简并：按「朝板心一侧倒」做确定性破缺，规则关于板心镜像等变，不引入随机数。
+        """
+        b = self.blocks[i]
+        W, H = self.W, self.H
+        depth = self.press_depth
+        own = depth[b.cx + b.cy * W]
+
+        def neighbor(x, y):
+            if not (0 <= x < W and 0 <= y < H):
+                return own          # 墙：法向反作用平衡掉这一侧
+            return depth[x + y * W] if self.owner[x + y * W] >= 0 else 0
+
+        dl = neighbor(b.cx - 1, b.cy)
+        dr = neighbor(b.cx + 1, b.cy)
+        du = neighbor(b.cx, b.cy - 1)
+        dd = neighbor(b.cx, b.cy + 1)
+        gcx = sub(dr, dl)
+        gcy = sub(dd, du)
+        gpar = add(mul(gcx, self.press_ux), mul(gcy, self.press_uy))
+        tx = sub(gcx, mul(gpar, self.press_ux))
+        ty = sub(gcy, mul(gpar, self.press_uy))
+        ax = neg(mul(self.press_kg, tx))
+        ay = neg(mul(self.press_kg, ty))
+        if tx == 0 and ty == 0 and own > 0:
+            # 找与真实侧向最接近的一对邻居；两边都空才是自由站立的窄柱。墙侧会给出非零梯度，走不到这里。
+            sx, sy = neg(self.press_uy), self.press_ux
+            best_p = best_m = None
+            for ox, oy in ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)):
+                dot = add(mul(from_float(ox), sx), mul(from_float(oy), sy))
+                if best_p is None or dot > best_p[0]:
+                    best_p = (dot, ox, oy)
+                if best_m is None or dot < best_m[0]:
+                    best_m = (dot, ox, oy)
+
+            def empty(x, y):
+                return 0 <= x < W and 0 <= y < H and self.owner[x + y * W] < 0
+
+            if empty(b.cx + best_p[1], b.cy + best_p[2]) and empty(b.cx + best_m[1], b.cy + best_m[2]):
+                dcx = sub(from_float((W - 1) * 0.5), from_float(b.cx))
+                dcy = sub(from_float((H - 1) * 0.5), from_float(b.cy))
+                toward = add(mul(dcx, sx), mul(dcy, sy))
+                f = mul(self.press_kg, own if toward > 0 else neg(own))
+                ax = add(ax, mul(f, sx))
+                ay = add(ay, mul(f, sy))
+        return ax, ay
+
+    def _extra_accel(self, i: int):
+        """内聚 + 静水压强，合并成一次加进子步的加速度。两者都只依赖子步开始时的状态。"""
+        fx = fy = 0
+        if self.cohesion_on:
+            fx, fy = self._cohesion(i)
+        if self.press_active:
+            px, py = self._pressure(i)
+            fx = add(fx, px)
+            fy = add(fy, py)
+        return fx, fy
+
+    def _contact_line(self, b: Block):
+        """接触线力：沿壁面指向背离液体的一侧。
+
+        只在「壁面格 + 沿壁方向一侧空、一侧满」时作用。空的那侧是接触线外侧，力把它往外拉；两侧都空（孤立柱）或都满（平直接触线）时没有定义，不施加。
+
+        这一项是必要的：虚拟壁面键是法向的，单独作用只会把水压向墙，接触线一步也不会爬。连续介质里让液面上升的是压力场与界面曲率的集体作用，格点模型没有那层传递，只能把 Young 方程的线力显式写出来。wetting_gain 就是给这个缺失的集体效应留的旋钮。
+        """
+        if self.line_force == 0:
+            return 0, 0
+        f = self.line_force
+        fx = 0
+        fy = 0
+        # 沿壁方向的邻居必须都在界内：越界的那一侧是容器端点，不是液-气界面，把它算成“空”会在池底凭空加一个向下的线力。
+        if (b.cx == 0 or b.cx == self.W - 1) and 0 < b.cy < self.H - 1:
+            up = self._is_water(b.cx, b.cy - 1)
+            down = self._is_water(b.cx, b.cy + 1)
+            if not up and down:
+                fy = sub(fy, f)
+            elif up and not down:
+                fy = add(fy, f)
+        if (b.cy == 0 or b.cy == self.H - 1) and 0 < b.cx < self.W - 1:
+            left = self._is_water(b.cx - 1, b.cy)
+            right = self._is_water(b.cx + 1, b.cy)
+            if not left and right:
+                fx = sub(fx, f)
+            elif left and not right:
+                fx = add(fx, f)
+        return fx, fy
 
     def _plate_friction(self, b: Block) -> None:
         """板面库仑摩擦：本子步最多把速度的模减少 fdv = μ_p·N。

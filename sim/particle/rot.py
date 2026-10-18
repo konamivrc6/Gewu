@@ -20,23 +20,27 @@
 
 用法：
 
-    python sim/rot.py                              # μ = 0.2，三档转速，恒定转速
-    python sim/rot.py --rps 0.2 0.5 1.0 --mu 0.1 0.3 0.5
-    python sim/rot.py --show --rps 0.5             # 画出末态
-    python sim/rot.py --no-mirror                  # 跳过镜像检验
-    python sim/rot.py --gravity 0.0012 --tilt 30   # 倾斜着转：重力与转动同时上
-    python sim/rot.py --axis 1 0 0 --show          # 绕板面内的 x 轴转：料被推离转轴，分成两条
-    python sim/rot.py --rps 0.1 0.2 0.3 0.5        # 看静摩擦的临界转速：0.2 以下一块都不动
-    python sim/rot.py --plate-friction 0           # 关掉板面摩擦，退回到与转速无关的版本
+    python sim/particle/rot.py                              # μ = 0.2，三档转速，恒定转速
+    python sim/particle/rot.py --rps 0.2 0.5 1.0 --mu 0.1 0.3 0.5
+    python sim/particle/rot.py --show --rps 0.5             # 画出末态
+    python sim/particle/rot.py --no-mirror                  # 跳过镜像检验
+    python sim/particle/rot.py --gravity 0.0012 --tilt 30   # 倾斜着转：重力与转动同时上
+    python sim/particle/rot.py --axis 1 0 0 --show          # 绕板面内的 x 轴转：料被推离转轴，分成两条
+    python sim/particle/rot.py --rps 0.1 0.2 0.3 0.5        # 看静摩擦的临界转速：0.2 以下一块都不动
+    python sim/particle/rot.py --plate-friction 0           # 关掉板面摩擦，退回到与转速无关的版本
 """
 
 from __future__ import annotations
 
 import argparse
 import math
+import os
 import sys
 import time
 import unicodedata
+
+# 脚本住在 sim/particle/，公共模块（fixed / spawn）在上一层，先把它加进搜索路径。
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import checker
 import world2 as V2
@@ -165,7 +169,8 @@ def main(argv: list[str]) -> int:
 
     print(f"平面内重力 {a.gravity}  斜坡 {a.ramp} 帧  保持 {a.hold} 帧  转轴 {pivot}  轴 {tuple(a.axis)}")
     print(f"总重力 G {a.gravity_total}  板面 μ_p {a.plate_friction}")
-    print(f"帧率按 {120.0 / 2:.0f} Hz（substep_hz = 120，2 子步）\n")
+    _dflt = V2.Params()
+    print(f"帧率按 {_dflt.substep_hz / _dflt.substeps:.0f} Hz（substep_hz = {_dflt.substep_hz:.0f}，{_dflt.substeps} 子步）\n")
 
     for mu in a.mu:
         print(f"μ = {mu}")

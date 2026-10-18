@@ -2,9 +2,9 @@
 
 用途：把 `firmware/Gewu/Gewu.ino` 里的 C++ 内核与 `sim/world2.py` 逐位对照。板上发 `v plain 240`、`v friction 240`、`v spin 600`，这里用同样的场景、同样的重力向量与同样的哈希取词顺序生成期望，逐行 diff。
 
-    python sim/port_trace.py plain 240
-    python sim/port_trace.py friction 240
-    python sim/port_trace.py spin 600
+    python sim/particle/port_trace.py plain 240
+    python sim/particle/port_trace.py friction 240
+    python sim/particle/port_trace.py spin 600
 
 三种场景与固件里的 runTrace() 一一对应：
 
@@ -21,9 +21,8 @@ import math
 import os
 import sys
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-if HERE not in sys.path:
-    sys.path.insert(0, HERE)
+# 脚本住在 sim/particle/，公共模块（fixed / spawn）在上一层，先把它加进搜索路径。
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import checker
 import fixed
@@ -50,15 +49,20 @@ def center_cells() -> list[tuple[int, int]]:
     return [(x, y) for y in range(2, 6) for x in range(2, 6)]
 
 
+# 逐位基准必须钉在 2 子步 / 120 Hz：固件 runTrace() 用的是 PhysicsWorld::Params 的默认值，
+# 而 sim/world2.py 的默认已经跟固件主循环对齐到 4 / 240。这里显式写死，不跟随默认。
+TRACE_SUBSTEPS = dict(substeps=2, substep_hz=120.0)
+
+
 def build(kind: str):
     if kind == "spin":
-        p = W.Params(n=16, gravity=0.0, plate_friction=0.0, friction=0.2)
+        p = W.Params(n=16, gravity=0.0, plate_friction=0.0, friction=0.2, **TRACE_SUBSTEPS)
         g = (0, 0)
     elif kind == "plain":
-        p = W.Params(n=16)
+        p = W.Params(n=16, **TRACE_SUBSTEPS)
         g = (0, 79)
     elif kind == "friction":
-        p = W.Params(n=16)
+        p = W.Params(n=16, **TRACE_SUBSTEPS)
         g = (0, 33)
     else:
         raise ValueError(f"未知场景 {kind!r}")

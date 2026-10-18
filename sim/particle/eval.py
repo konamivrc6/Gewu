@@ -1,11 +1,11 @@
 """统一评测脚本。
 
-    python sim/eval.py invariant --engine v2     # 不变量与点亮数（判定性）
-    python sim/eval.py invariant --engine v1     # 同样的套件跑基线，应当看到非零
-    python sim/eval.py invariant --quick         # 四分之一帧数，改代码时快速自检
-    python sim/eval.py kinetic --engine both     # 动能守恒残差（诊断性）
-    python sim/eval.py ops --engine v2           # 每帧定点运算数（给 C3 对表）
-    python sim/eval.py plate                     # 板面静摩擦的启滑阈值，逐 LSB 扫
+    python sim/particle/eval.py invariant --engine v2     # 不变量与点亮数（判定性）
+    python sim/particle/eval.py invariant --engine v1     # 同样的套件跑基线，应当看到非零
+    python sim/particle/eval.py invariant --quick         # 四分之一帧数，改代码时快速自检
+    python sim/particle/eval.py kinetic --engine both     # 动能守恒残差（诊断性）
+    python sim/particle/eval.py ops --engine v2           # 每帧定点运算数（给 C3 对表）
+    python sim/particle/eval.py plate                     # 板面静摩擦的启滑阈值，逐 LSB 扫
 
 **判定性指标**
 
@@ -17,16 +17,20 @@
 3. 动能守恒残差。无关重力、阻尼置 1，从同一初态跑；剩下的能量损失只可能来自碰撞与非牛顿操作。它直接量化"修补层吃掉了多少能量"，是能戳穿"廉价地强"那类方案的指标
 4. 每帧定点运算数。打开 `fixed.COUNT` 跑一帧。Python 里的耗时没有意义，只有计数能搬到 C3 上对表
 
-各向异性扫描在 `sim/aniso.py`，转动与转置镜像在 `sim/rot.py`；滞后回线还没实现——它要的是手感，不是不变量。
+各向异性扫描在 `sim/particle/aniso.py`，转动与转置镜像在 `sim/particle/rot.py`；滞后回线还没实现——它要的是手感，不是不变量。
 """
 
 from __future__ import annotations
 
 import argparse
 import math
+import os
 import random
 import sys
 import unicodedata
+
+# 脚本住在 sim/particle/，公共模块（fixed / spawn）在上一层，先把它加进搜索路径。
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import checker
 import fixed

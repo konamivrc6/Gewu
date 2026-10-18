@@ -12,6 +12,12 @@
 
 from __future__ import annotations
 
+import os
+import sys
+
+# 内核住在 sim/，定点原语与摆位在同一层；粒子脚本在 sim/particle/ 时会把这个目录加进路径。
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import fixed
 
 

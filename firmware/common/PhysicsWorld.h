@@ -33,6 +33,10 @@ struct Params {
   double friction;         // 块-块与块-墙的库仑系数 μ
   double damping;
   double vmax;             // 格/子步，必须 < 1
+  double cohesion;         // 八邻域内聚加速度，格/子步²；0 = 关闭。水模式的核心项
+  double cohesionDiag;     // 对角键相对轴向的权重，0..1
+  double cohesionDamping;  // 沿键轴的相对速度阻尼，0..1。等效黏性
+  double hydrostatic;      // 静水压强增益，0 = 关闭。横向加速度 = 增益 · g∥ · 两侧水头差。补上内聚力缺的「重量变横向推力」那一环
   double pivotX;           // 转动原点 = 加速度计位置，格坐标
   double pivotY;
   uint8_t substeps;
@@ -44,6 +48,7 @@ struct Params {
       : worldW(8), worldH(8), gravity(0.0012), gravityTotal(0.0012),
         plateFriction(0.35), restitution(0.20), restitutionSlop(0.004),
         friction(0.55), damping(0.9995), vmax(0.6),
+        cohesion(0.0), cohesionDiag(0.5), cohesionDamping(0.0), hydrostatic(0.0),
         pivotX(4.0), pivotY(4.0), substeps(2), substepHz(120.0),
         gateOrder(GATE_PEN), axisOrder(AXIS_VEL) {}
 };
@@ -51,6 +56,24 @@ struct Params {
 struct Block {
   int32_t px, py, vx, vy;   // Q16.16
   int16_t cx, cy;
+};
+
+// 八邻域扫描顺序与 sim/world2.py 的 _COH_OFFSETS 逐项一致：dy 外层、dx 内层，跳过 (0,0)。
+// 方向只取格偏移，不取粒子的连续位置：八邻域全满时向量和为零，净力只出现在边界，体内没有剪切刚度。
+struct CohesionOffset {
+  int8_t dx, dy;
+  int32_t ux, uy;
+  bool diag;
+};
+static const CohesionOffset COHESION_OFFSETS[8] = {
+  {-1, -1, -46341, -46341, true},
+  { 0, -1,      0, -65536, false},
+  { 1, -1,  46341, -46341, true},
+  {-1,  0, -65536,      0, false},
+  { 1,  0,  65536,      0, false},
+  {-1,  1, -46341,  46341, true},
+  { 0,  1,      0,  65536, false},
+  { 1,  1,  46341,  46341, true},
 };
 
 struct Stats {
@@ -130,6 +153,16 @@ class PhysicsWorld {
   void setRestitutionQ16(int32_t e) { e_ = e; }
   void setRestitutionSlopQ16(int32_t s) { eslop_ = s; }
   void setDampingQ16(int32_t d) { damp_ = d; }
+  // ---------- 内聚（水模式） ----------
+  bool setCohesionFloat(double c);
+  bool setCohesionDiagFloat(double d);
+  bool setCohesionDampingFloat(double d);
+  double cohesion() const { return p_.cohesion; }
+  double cohesionDiag() const { return p_.cohesionDiag; }
+  double cohesionDamping() const { return p_.cohesionDamping; }
+  // ---------- 静水压强（水模式） ----------
+  bool setHydrostaticFloat(double h);
+  double hydrostatic() const { return p_.hydrostatic; }
   bool setVmaxQ16(int32_t v);
   void setSubsteps(uint8_t n) { if (n > 0) p_.substeps = n; }
   void setGateOrder(GateOrder o) { p_.gateOrder = o; }
@@ -155,6 +188,11 @@ class PhysicsWorld {
 
  private:
   uint32_t nextRand();
+  bool rebuildCohesion();
+  void cohesionAccel(uint8_t i, int32_t &fx, int32_t &fy) const;
+  void updatePressure(int32_t gx, int32_t gy);
+  void buildPressureDepth();
+  void pressureAccel(uint8_t i, int32_t &fx, int32_t &fy) const;
   void plateFriction(Block &b);
   int32_t pen(uint8_t i) const;
   void gate(uint8_t i, uint8_t axis);
@@ -178,6 +216,16 @@ class PhysicsWorld {
   int32_t gn_, mup_, fdv_;
   int32_t e_, eslop_, mu_, damp_, vmax_, eps_;
   bool frictionAuto_;
+  int32_t aco_, acod_, cdamp_;      // 轴向 / 对角键力，键轴阻尼
+  int32_t cohForce_[8][2];          // 预计算的八个方向力
+  bool cohesionOn_;
+  int32_t press_;                   // 静水压强增益，Q16.16
+  bool pressOn_;                    // 增益非零，才需要每子步算压强
+  bool pressActive_;                // 本子步有效（增益与 g∥ 都非零）
+  int32_t pressKg_;                 // 增益 · |g∥|
+  int32_t pressUx_, pressUy_;       // 真实重力单位向量（Q16.16，指向重力一侧）
+  int32_t pressRayX_, pressRayY_;   // -0.5 · 单位重力，半格步长
+  int32_t pressDepth_[MAX_CELLS];   // 水头表，单位格，Q16.16；空格为 0
 
   int32_t pivx_, pivy_;
   int32_t omega_[3];
@@ -223,6 +271,17 @@ inline bool PhysicsWorld::init(const Params &p) {
   if (vmax_ <= 0 || vmax_ >= fx::ONE) return false;
   eps_ = fx::fromFloat(1e-4);
   frictionAuto_ = true;
+  if (!rebuildCohesion()) return false;
+  if (p.hydrostatic < 0.0) return false;
+  press_ = fx::fromFloat(p.hydrostatic);
+  pressOn_ = (press_ != 0);
+  pressActive_ = false;
+  pressKg_ = 0;
+  pressUx_ = 0;
+  pressUy_ = fx::ONE;
+  pressRayX_ = 0;
+  pressRayY_ = -(fx::ONE >> 1);
+  memset(pressDepth_, 0, sizeof(pressDepth_));
 
   pivx_ = fx::fromFloat(p.pivotX);
   pivy_ = fx::fromFloat(p.pivotY);
@@ -365,6 +424,203 @@ inline bool PhysicsWorld::setVmaxQ16(int32_t v) {
   return true;
 }
 
+// ---------- 内聚 ----------
+
+inline bool PhysicsWorld::rebuildCohesion() {
+  if (p_.cohesion < 0.0) return false;
+  if (p_.cohesionDiag < 0.0 || p_.cohesionDiag > 1.0) return false;
+  if (p_.cohesionDamping < 0.0 || p_.cohesionDamping > 1.0) return false;
+  aco_ = fx::fromFloat(p_.cohesion);
+  acod_ = fx::fromFloat(p_.cohesion * p_.cohesionDiag);
+  cdamp_ = fx::fromFloat(p_.cohesionDamping);
+  cohesionOn_ = (cdamp_ != 0);
+  for (uint8_t k = 0; k < 8; k++) {
+    const int32_t a = COHESION_OFFSETS[k].diag ? acod_ : aco_;
+    cohForce_[k][0] = fx::mul(a, COHESION_OFFSETS[k].ux);
+    cohForce_[k][1] = fx::mul(a, COHESION_OFFSETS[k].uy);
+    if (cohForce_[k][0] != 0 || cohForce_[k][1] != 0) cohesionOn_ = true;
+  }
+  return true;
+}
+
+inline bool PhysicsWorld::setCohesionFloat(double c) {
+  if (c < 0.0) return false;
+  p_.cohesion = c;
+  return rebuildCohesion();
+}
+
+inline bool PhysicsWorld::setCohesionDiagFloat(double d) {
+  if (d < 0.0 || d > 1.0) return false;
+  p_.cohesionDiag = d;
+  return rebuildCohesion();
+}
+
+inline bool PhysicsWorld::setCohesionDampingFloat(double d) {
+  if (d < 0.0 || d > 1.0) return false;
+  p_.cohesionDamping = d;
+  return rebuildCohesion();
+}
+
+inline void PhysicsWorld::cohesionAccel(uint8_t i, int32_t &fx, int32_t &fy) const {
+  const Block &b = blocks_[i];
+  fx = 0;
+  fy = 0;
+  for (uint8_t k = 0; k < 8; k++) {
+    const CohesionOffset &o = COHESION_OFFSETS[k];
+    const int16_t nx = (int16_t)(b.cx + o.dx);
+    const int16_t ny = (int16_t)(b.cy + o.dy);
+    if (nx < 0 || nx >= (int16_t)W_ || ny < 0 || ny >= (int16_t)H_) continue;
+    const int16_t j = owner_[nx + ny * (int16_t)W_];
+    if (j < 0) continue;
+    fx = fx::add(fx, cohForce_[k][0]);
+    fy = fx::add(fy, cohForce_[k][1]);
+    if (cdamp_ != 0) {
+      const Block &o2 = blocks_[j];
+      const int32_t vrel = fx::add(fx::mul(fx::sub(b.vx, o2.vx), o.ux),
+                                   fx::mul(fx::sub(b.vy, o2.vy), o.uy));
+      const int32_t d = fx::mul(cdamp_, vrel);
+      fx = fx::sub(fx, fx::mul(d, o.ux));
+      fy = fx::sub(fy, fx::mul(d, o.uy));
+    }
+  }
+}
+
+// ---------- 静水压强 ----------
+
+inline bool PhysicsWorld::setHydrostaticFloat(double h) {
+  if (h < 0.0) return false;
+  p_.hydrostatic = h;
+  press_ = fx::fromFloat(h);
+  pressOn_ = (press_ != 0);
+  if (!pressOn_) pressActive_ = false;
+  return true;
+}
+
+inline void PhysicsWorld::updatePressure(int32_t gx, int32_t gy) {
+  if (!pressOn_) {
+    pressActive_ = false;
+    return;
+  }
+  const int32_t gmag = fx::hypot(gx, gy);
+  if (gmag == 0) {
+    pressActive_ = false;
+    return;
+  }
+  // 真实重力方向，归一化后不再量化：射线可以沿任意角度走。
+  pressUx_ = fx::div(gx, gmag);
+  pressUy_ = fx::div(gy, gmag);
+  pressRayX_ = fx::halve(fx::neg(pressUx_));
+  pressRayY_ = fx::halve(fx::neg(pressUy_));
+  pressKg_ = fx::mul(press_, gmag);
+  pressActive_ = (pressKg_ != 0);
+  if (pressActive_) buildPressureDepth();
+}
+
+inline void PhysicsWorld::buildPressureDepth() {
+  memset(pressDepth_, 0, sizeof(pressDepth_));
+  const int32_t half = fx::ONE >> 1;
+  for (uint8_t i = 0; i < count_; i++) {
+    const Block &b = blocks_[i];
+    int32_t px = fx::add(fx::fromFloat((double)b.cx), half);
+    int32_t py = fx::add(fx::fromFloat((double)b.cy), half);
+    uint8_t n = 0;
+    for (uint8_t k = 0; k < 24; k++) {
+      const int32_t qx = fx::add(px, pressRayX_);
+      const int32_t qy = fx::add(py, pressRayY_);
+      const int16_t nx = (int16_t)fx::cellOf(qx);
+      const int16_t ny = (int16_t)fx::cellOf(qy);
+      if (nx < 0 || nx >= (int16_t)W_ || ny < 0 || ny >= (int16_t)H_) break;
+      if (owner_[nx + ny * (int16_t)W_] < 0) break;
+      px = qx;
+      py = qy;
+      n++;
+    }
+    // (px,py) 是最后一个仍有水的采样点。求射线穿过该格边界的比例 f ∈ [0,1]，把水头做成连续值；否则射线跨格时会跳半格。
+    const int16_t ox = (int16_t)fx::cellOf(px);
+    const int16_t oy = (int16_t)fx::cellOf(py);
+    const int16_t cx = (int16_t)fx::cellOf(fx::add(px, pressRayX_));
+    const int16_t cy = (int16_t)fx::cellOf(fx::add(py, pressRayY_));
+    int32_t bestF = 0;
+    bool haveF = false;
+    if (cx != ox && pressRayX_ != 0) {
+      const int32_t bx = fx::fromFloat((double)(cx > ox ? ox + 1 : ox));
+      const int32_t f = fx::div(fx::sub(bx, px), pressRayX_);
+      if (f >= 0) {
+        bestF = f;
+        haveF = true;
+      }
+    }
+    if (cy != oy && pressRayY_ != 0) {
+      const int32_t by = fx::fromFloat((double)(cy > oy ? oy + 1 : oy));
+      const int32_t f = fx::div(fx::sub(by, py), pressRayY_);
+      if (f >= 0 && (!haveF || f < bestF)) {
+        bestF = f;
+        haveF = true;
+      }
+    }
+    const int32_t nq = fx::add(fx::fromFloat((double)n), haveF ? bestF : 0);   // 半格计数，含小数
+    pressDepth_[b.cx + b.cy * (int16_t)W_] =
+        (nq > fx::ONE) ? fx::halve(fx::sub(nq, fx::ONE)) : 0;
+  }
+}
+
+inline void PhysicsWorld::pressureAccel(uint8_t i, int32_t &fx, int32_t &fy) const {
+  const Block &b = blocks_[i];
+  const int32_t own = pressDepth_[b.cx + b.cy * (int16_t)W_];
+  // 墙外返回自身水头：墙的法向反作用平衡掉这一侧，不计压差。
+  auto neighbor = [&](int16_t x, int16_t y) -> int32_t {
+    if (x < 0 || x >= (int16_t)W_ || y < 0 || y >= (int16_t)H_) return own;
+    const int16_t idx = (int16_t)(x + y * (int16_t)W_);
+    return (owner_[idx] >= 0) ? pressDepth_[idx] : 0;
+  };
+  const int32_t gcx = fx::sub(neighbor((int16_t)(b.cx + 1), b.cy), neighbor((int16_t)(b.cx - 1), b.cy));
+  const int32_t gcy = fx::sub(neighbor(b.cx, (int16_t)(b.cy + 1)), neighbor(b.cx, (int16_t)(b.cy - 1)));
+  // 压力梯度里沿重力那一半正好抵消重力，已经由接触与法向支撑处理；这里只留垂直分量。
+  const int32_t gpar = fx::add(fx::mul(gcx, pressUx_), fx::mul(gcy, pressUy_));
+  const int32_t tx = fx::sub(gcx, fx::mul(gpar, pressUx_));
+  const int32_t ty = fx::sub(gcy, fx::mul(gpar, pressUy_));
+  fx = fx::neg(fx::mul(pressKg_, tx));
+  fy = fx::neg(fx::mul(pressKg_, ty));
+  // 两侧都是自由面、水头也相等时是真正的对称简并：按「朝板心一侧倒」做确定性破缺。
+  if (tx == 0 && ty == 0 && own > 0) {
+    const int32_t sx = fx::neg(pressUy_);
+    const int32_t sy = pressUx_;
+    int32_t bestP = 0, bestM = 0;
+    int8_t pdx = 0, pdy = 0, mdx = 0, mdy = 0;
+    bool haveP = false, haveM = false;
+    for (uint8_t k = 0; k < 8; k++) {
+      const CohesionOffset &o = COHESION_OFFSETS[k];
+      const int32_t dot = fx::add(fx::mul(fx::fromFloat((double)o.dx), sx),
+                                  fx::mul(fx::fromFloat((double)o.dy), sy));
+      if (!haveP || dot > bestP) {
+        bestP = dot;
+        pdx = o.dx;
+        pdy = o.dy;
+        haveP = true;
+      }
+      if (!haveM || dot < bestM) {
+        bestM = dot;
+        mdx = o.dx;
+        mdy = o.dy;
+        haveM = true;
+      }
+    }
+    auto empty = [&](int16_t x, int16_t y) -> bool {
+      return x >= 0 && x < (int16_t)W_ && y >= 0 && y < (int16_t)H_ &&
+             owner_[x + y * (int16_t)W_] < 0;
+    };
+    if (haveP && haveM && empty((int16_t)(b.cx + pdx), (int16_t)(b.cy + pdy)) &&
+        empty((int16_t)(b.cx + mdx), (int16_t)(b.cy + mdy))) {
+      const int32_t dcx = fx::sub(fx::fromFloat((W_ - 1) * 0.5), fx::fromFloat((double)b.cx));
+      const int32_t dcy = fx::sub(fx::fromFloat((H_ - 1) * 0.5), fx::fromFloat((double)b.cy));
+      const int32_t toward = fx::add(fx::mul(dcx, sx), fx::mul(dcy, sy));
+      const int32_t f = fx::mul(pressKg_, toward > 0 ? own : fx::neg(own));
+      fx = fx::add(fx, fx::mul(f, sx));
+      fy = fx::add(fy, fx::mul(f, sy));
+    }
+  }
+}
+
 // ---------- 转动 ----------
 
 inline bool PhysicsWorld::setSpin(double rps, double rpsDot, const double *axis, const double *pivot) {
@@ -461,6 +717,25 @@ inline void PhysicsWorld::substep() {
     cross = fx::mul(wx, wy);
   }
 
+  // 内聚力与静水压强必须先用全体块的旧状态算完，再统一施加。边算边改会让先处理到的块污染邻居用于阻尼的速度，结果会依赖块的存储顺序。
+  updatePressure(gx, gy);
+  const bool extraOn = (cohesionOn_ || pressActive_);
+  int32_t extX[MAX_BLOCKS], extY[MAX_BLOCKS];
+  if (extraOn) {
+    for (uint8_t i = 0; i < count_; i++) {
+      int32_t ex = 0, ey = 0;
+      if (cohesionOn_) cohesionAccel(i, ex, ey);
+      if (pressActive_) {
+        int32_t px = 0, py = 0;
+        pressureAccel(i, px, py);
+        ex = fx::add(ex, px);
+        ey = fx::add(ey, py);
+      }
+      extX[i] = ex;
+      extY[i] = ey;
+    }
+  }
+
   for (uint8_t i = 0; i < count_; i++) {
     Block &b = blocks_[i];
     if (spin) {
@@ -470,13 +745,23 @@ inline void PhysicsWorld::substep() {
       const int32_t cenX = fx::sub(fx::add(fx::mulSq(wy, rx), fx::mulSq(wz, rx)), fx::mul(cross, ry));
       const int32_t cenY = fx::sub(fx::add(fx::mulSq(wx, ry), fx::mulSq(wz, ry)), fx::mul(cross, rx));
       // 科氏 +2Ωz(v_y, −v_x)；欧拉 +Ω̇z(r_y, −r_x)。Ωx、Ωy、Ω̇x、Ω̇y 的那部分垂直纸面，被支持力吃掉。
-      const int32_t ax = fx::add(fx::add(gx, cenX), fx::add(fx::mul(twz, b.vy), fx::mul(wdz, ry)));
-      const int32_t ay = fx::sub(fx::add(gy, cenY), fx::add(fx::mul(twz, b.vx), fx::mul(wdz, rx)));
+      int32_t ax = fx::add(fx::add(gx, cenX), fx::add(fx::mul(twz, b.vy), fx::mul(wdz, ry)));
+      int32_t ay = fx::sub(fx::add(gy, cenY), fx::add(fx::mul(twz, b.vx), fx::mul(wdz, rx)));
+      if (extraOn) {
+        ax = fx::add(ax, extX[i]);
+        ay = fx::add(ay, extY[i]);
+      }
       b.vx = fx::clamp(fx::mul(fx::add(b.vx, ax), damp_), -vmax_, vmax_);
       b.vy = fx::clamp(fx::mul(fx::add(b.vy, ay), damp_), -vmax_, vmax_);
     } else {
-      b.vx = fx::clamp(fx::mul(fx::add(b.vx, gx), damp_), -vmax_, vmax_);
-      b.vy = fx::clamp(fx::mul(fx::add(b.vy, gy), damp_), -vmax_, vmax_);
+      int32_t ax = gx;
+      int32_t ay = gy;
+      if (extraOn) {
+        ax = fx::add(ax, extX[i]);
+        ay = fx::add(ay, extY[i]);
+      }
+      b.vx = fx::clamp(fx::mul(fx::add(b.vx, ax), damp_), -vmax_, vmax_);
+      b.vy = fx::clamp(fx::mul(fx::add(b.vy, ay), damp_), -vmax_, vmax_);
     }
     plateFriction(b);       // 体表力，在跨格门之前
     b.px = fx::add(b.px, b.vx);

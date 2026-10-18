@@ -1,9 +1,11 @@
 /*
- * Gewu 正式固件 v0.1 —— 格子锚定物理内核 + 编码器增删粒子
+ * Gewu 正式固件 v0.2 —— 格子锚定物理内核 + 水 / 粒子双模式
  * ========================================================
  *
  * 这一版接编码器与 MPU6500 两路输入：顺时针一格在随机空白格添加一个粒子，逆时针一格删除最新添加的粒子（上限 64）；加速度计给实时重力，陀螺给三轴角速度，粒子会因倾斜滑落、因甩板获得冲量、因转板受到离心/科氏/欧拉力。IMU 没就绪时退回“平放、无平面内重力、不转动”，屏幕保持静止。
- * SW3 是演示用的慢速生成任务：按下清空全部粒子并立刻补一颗，之后每 60 秒加一颗；任意微动按下或编码器转过一格都会打断它。
+ * SW3 是演示用的慢速生成任务：按下清空全部粒子并立刻补一颗，之后每 60 秒加一颗；SW3 重按、编码器按下或转过一格都会打断它。SW2 切换水 / 粒子模式，切换保留现有粒子、只恢复该模式的默认参数，不打断这个任务，后续粒子按新模式的物理继续加。编码器按下直接清空全部粒子。
+ *
+ * 水模式（feat/water 分支默认）：板面与块间摩擦归零，只留静水压强，重力标度 0.0120，不再按倍数绑定粒子模式，转速增益取两倍（200%；离心按 ω² 长，实际是四倍）。一格一颗保证不可压缩，竖直方向上的重量沿重力反方向数出水头差，变成横向推力，所以竖柱会塌、液面会平。内聚力与键轴黏性取很小的值（a 4 / j 4）：4 mm 的格子上表面张力的毛细长度 2.7 mm、黏性边界层 0.2 mm，两者都不足一个像素，宏观形状由静水压强决定；但低速流淌时没有它们，水会散成单个格子。m particles 切回粒子模式，a / j 可现场把内聚与黏性加回来，h 调静水压强，g 调当前模式的重力标度。
  *
  * 物理内核在 ../common/PhysicsWorld.h，逐位移植自 sim/world2.py；定点原语在 ../common/fixed_q16.h。这个草图只做三件事：读传感器、把输入翻译成增删与转动、把格号画到点阵上。
  *
@@ -54,23 +56,53 @@ static const float    GYRO_DEADBAND_DPS = 0.2f;   // 标定残差 ≤0.03 dps、
 static const float    GYRO_WD_TAU_S     = 0.025f; // 25 ms 低通，把差分的 0.28 rad/s² 噪声压到约 0.08
 static const float    GYRO_WD_DEADBAND  = 0.5f;   // rad/s²，低通后仍低于此值就归零
 static const uint8_t  SPIN_FAIL_LIMIT   = 3;      // 连续读失败约 15 ms 就停转，不保留旧转速
-static const uint32_t SUBSTEP_US      = 8333;     // 120 Hz 子步，1e6 / 120 的整数近似，误差 0.004%
-static const uint8_t  MAX_CATCHUP     = 4;        // 一次 loop 最多补 4 个子步，约 33 ms
+static const uint32_t SUBSTEP_US      = 4167;     // 240 Hz 子步，1e6 / 240 的整数近似，误差 0.008%
+static const uint8_t  MAX_CATCHUP     = 8;        // 一次 loop 最多补 8 个子步，约 33 ms
 // 微动消抖。硬件已各配 4.7k 上拉与 100nF（硬件接线.md 5.5 / 6.3），软件只补一道 15 ms 稳定确认。
 static const uint32_t DEBOUNCE_MS     = 15;
 // SW3 慢速生成任务的默认周期。串口 t N 可临时改，重启回到这里。
 static const uint32_t DRIP_INTERVAL_MS = 60000;
-// 1 g 对应引擎的格/子步²。这是标度旋钮，不是标定常数；串口 g N 按 N/10000 现场改，例如 g 40 = 0.0040。
-static const double   GRAVITY_PER_G_INIT = 0.0040;
-static double         gravityPerG        = GRAVITY_PER_G_INIT;
+// 1 g 对应引擎的格/子步²。这是标度旋钮，不是标定常数；串口 g N 按 N/10000 现场改，例如 g 118 = 0.0118。
+// 粒子模式按 1 格 = 4 mm、每帧 4 子步折算，实时重力是 0.0426；0.0118 对应约 1.9 倍慢放，再高就压不住堆叠——竖直柱的冲量每子步最多传一格，
+// 顶层残余 |vy| 与 g 成正比，0.012 附近约 0.28 格/子步，接近 vmax 的一半，再提就会抖散。这条是内核上限，不是审美取舍。
+static const double   GRAVITY_PER_G_INIT = 0.0118;
+// 水模式不再按倍数绑定粒子。粒子提到 0.0118 后两者已经接近，水的「更重」由静水压强表现，重力标度保持原绝对值，手感不被粒子调参牵动。
+static const double   GRAVITY_PER_G_WATER = 0.0120;
+static double         gravityPerG        = GRAVITY_PER_G_WATER;
 // 转速增益，百分数。转动伪力随它线性缩放（离心是平方），串口 w N 现场改，0 等于停转。
-static const uint16_t SPIN_SCALE_INIT = 100;
-static uint16_t       spinScale       = SPIN_SCALE_INIT;
+// 粒子模式保持 100%：IMU 给的是真实角速度，离心 ω²r 本来就应该和重力同尺度；重力标度提到实时附近之后，两者的比例才是物理的，人为放大反而假。
+// 水模式仍取 200%，那是艺术夸张——水的黏性与低摩擦让它需要更明显的甩动才看得出来。
+static const uint16_t SPIN_SCALE_INIT  = 100;
+static const uint16_t SPIN_SCALE_WATER = 200;
+static uint16_t       spinScale        = SPIN_SCALE_WATER;
 static const double   RAD_PER_DEG     = 0.017453292519943295769;   // 不要叫 DEG_TO_RAD，Arduino.h 里已有同名宏
 // 手感初值。PhysicsWorld::Params 的默认仍是 0.35 / 0.55，那是与 Python 原型逐位对照用的；固件在这里单独覆盖，别把两边混成一个默认值。
-// 甩板灵敏度比上一版更高：重力标度翻倍，板面静摩擦从 0.15 降到 0.08，启滑倾角约 4.6°。
-static const double   PLATE_FRICTION_INIT = 0.08; // 板面 μ_p。0.35 的启滑倾角约 19°，0.15 约 8.5°，0.08 约 4.6°
-static const double   PAIR_FRICTION_INIT  = 0.40; // 块-块与块-墙 μ。0.55 的堆与墙偏黏，0.40 更活
+// 这组值按「颗粒材料」反推，不是按某一种实物标定：方块不滚、互锁强，真实材料的系数只能当起点。
+// 板面 μ_p 取 0.05，启滑倾角约 2.9°。真实圆粒在光滑板上会滚（滚动阻力系数 0.01~0.03），方块不会，所以要用很低的库仑系数去等效那个缺失的自由度。
+// 块-块 μ 取 0.45，按 tan 换回约 24° 的休止角；方块互锁比圆粒强，同样的 μ 会堆得更陡，0.45 是往回找的补偿。
+static const double   PLATE_FRICTION_INIT = 0.05; // 板面 μ_p
+static const double   PAIR_FRICTION_INIT  = 0.45; // 块-块与块-墙 μ
+// 水模式初值：零摩擦、零恢复、静水压强，再加一对很小的内聚力与键轴黏性。
+// 宏观形状由静水压强决定：4 mm 格子上表面张力的毛细长度 2.7 mm、黏性边界层 0.2 mm，都不足一个像素，
+// 32 mm 容器的邦德数是 138，所以关掉内聚力时倾斜、甩板、竖柱塌落的结果逐项不变。
+// 但低速流淌时会散成单个格子——速度差让相邻块逐渐分离，而内聚力只在相邻时作用，分开就回不来。
+// a 4 / j 4 是板上调出来的：a 3 还散，a 5 已经黏得发滞；j 负责把相邻块的速度差抹平，静止液面不受影响。
+// a / j 仍可现场改，重启回到这组。
+static const double   WATER_COHESION_INIT = 0.0004;
+static const double   WATER_COHESION_DIAG = 0.5;
+static const double   WATER_COHESION_DAMP = 0.04;
+// v water 的逐位基准独立于上面的手感参数：Python 的 sim/water/port_trace.py 写的就是这组，改常量不能动它。
+static const double   WATER_TRACE_COHESION = 0.0010;
+static const double   WATER_TRACE_COHESION_DIAG = 0.5;
+static const double   WATER_TRACE_COHESION_DAMP = 0.05;
+static const double   WATER_HYDROSTATIC_INIT = 1.0;   // 静水压强增益。1.0 = p = ρg·h 的水平梯度；0 关掉后竖直水柱会原地立着（旧版行为）
+static const double   WATER_RESTITUTION   = 0.0;
+// 0.50 是观感甜点：低于 0.4 碰撞闷，像掉进泥里；高于 0.6 一堆粒子同时弹就变成噪点。0.5 每跳留下 25% 的动能，视觉上是「弹一下、明显弹、收住」。
+static const double   PARTICLE_RESTITUTION = 0.50;
+// 速度阻尼按每秒损失折算。粒子 0.9998 在 240 Hz 下每秒剩约 95.3%，接近真实空气阻力（本可忽略），让碰撞与摩擦去耗散；
+// 水模式保持 0.9995：内聚力归零后它成了唯一的耗散，负责液面晃荡的衰减。真实水在 32 mm 容器里的晃荡衰减时间约 8 秒，慢放 1.9 倍后大致对得上。
+static const double   PARTICLE_DAMPING = 0.9998;
+static const double   WATER_DAMPING    = 0.9995;
 static const uint32_t I2C_HZ          = 400000;
 static const uint32_t K_MAX           = 60000;    // k 命令一次最多推进多少帧，防止串口挂死
 static const uint32_t TRACE_MAX_FRAME = 5000;
@@ -90,6 +122,9 @@ enum EncFunction : uint8_t {
   ENC_FN_COUNT
 };
 static uint8_t encFunction = ENC_FN_PARTICLES;
+
+enum SimMode : uint8_t { MODE_WATER = 0, MODE_PARTICLES = 1 };
+static uint8_t simMode = MODE_WATER;
 
 // ============================ 对象与状态 ============================
 
@@ -141,6 +176,9 @@ struct ImuRaw {
 
 enum ImuKind : uint8_t { IMU_NONE = 0, IMU_6050 = 1, IMU_6500 = 2 };
 
+// 放在 ImuRaw 之后：Arduino 的自动原型会插在第一个函数之前，函数放得太靠前会把原型顶到 struct ImuRaw 之前。
+static const char *simModeName() { return simMode == MODE_WATER ? "water" : "particles"; }
+
 // 串口行缓冲。和自检草图同一套：超长整行丢掉，只报一次错。
 static char    lineBuf[SERIAL_LINE_MAX];
 static uint8_t lineLen      = 0;
@@ -174,8 +212,7 @@ static ButtonState buttons[] = {
 };
 static const uint8_t BUTTON_COUNT = sizeof(buttons) / sizeof(buttons[0]);
 
-// SW3 慢速生成任务。按下清空全部粒子并立刻补一颗，之后每 dripIntervalMs 加一颗；
-// 任意微动按下或编码器转过一格都会终止它。串口命令不打断，方便台面调参时让它继续跑。
+// SW3 慢速生成任务。按下清空全部粒子并立刻补一颗，之后每 dripIntervalMs 加一颗；SW3 重按、编码器按下或转过一格都会终止它，SW2 只切模式不打断（后续粒子按新模式加）。串口命令不打断，方便台面调参时让它继续跑。
 static uint32_t dripIntervalMs = DRIP_INTERVAL_MS;
 static bool     dripActive  = false;
 static uint32_t dripNextMs  = 0;
@@ -576,6 +613,34 @@ static void renderWorld(bool force) {
   }
 }
 
+// 模式切换只改参数，不重建内核，种子与转动原点保持不变，也不清空现有粒子——同一个初态可以直接看两种物理的差别。
+static void applyMode(uint8_t mode) {
+  simMode = mode;
+  gravityPerG = (mode == MODE_WATER) ? GRAVITY_PER_G_WATER : GRAVITY_PER_G_INIT;
+  spinScale = (mode == MODE_WATER) ? SPIN_SCALE_WATER : SPIN_SCALE_INIT;
+  if (mode == MODE_WATER) {
+    world.setPlateFrictionQ16(0);
+    world.setPairFrictionQ16(0);
+    world.setRestitutionQ16(fx::fromFloat(WATER_RESTITUTION));
+    world.setCohesionFloat(WATER_COHESION_INIT);
+    world.setCohesionDiagFloat(WATER_COHESION_DIAG);
+    world.setCohesionDampingFloat(WATER_COHESION_DAMP);
+    world.setHydrostaticFloat(WATER_HYDROSTATIC_INIT);
+    world.setDampingQ16(fx::fromFloat(WATER_DAMPING));
+  } else {
+    world.setPlateFrictionQ16(fx::fromFloat(PLATE_FRICTION_INIT));
+    world.setPairFrictionQ16(fx::fromFloat(PAIR_FRICTION_INIT));
+    world.setRestitutionQ16(fx::fromFloat(PARTICLE_RESTITUTION));
+    world.setDampingQ16(fx::fromFloat(PARTICLE_DAMPING));
+    world.setCohesionFloat(0.0);
+    world.setCohesionDampingFloat(0.0);
+    world.setHydrostaticFloat(0.0);
+  }
+  // 按新模式的重力标度立刻刷新；IMU 就绪时下一个 5 ms 节拍会用真实姿态覆盖。切换模式本来就会清空粒子，停转没有副作用。
+  applyFallbackGravity();
+  renderWorld(true);
+}
+
 // ============================ 物理节拍 ============================
 
 static void tickPhysics() {
@@ -669,8 +734,19 @@ static void scanButtons(uint32_t nowMs) {
     if (!raw) continue;                             // 只处理按下沿
 
     eventLine(b.tag, "press");
-    if (b.pin == PIN_SW3) startDrip(nowMs);
-    else                  stopDrip("key");          // SW2 / ENCSW 只负责打断
+    if (b.pin == PIN_SW3) {
+      startDrip(nowMs);
+    } else if (b.pin == PIN_SW2) {
+      // SW2 只切模式，不打断 SW3 任务：applyMode 保留现有粒子，慢速生成继续按新模式加。
+      const uint8_t next = (simMode == MODE_WATER) ? MODE_PARTICLES : MODE_WATER;
+      applyMode(next);                              // 切换保留现有粒子，只恢复该模式的默认参数
+      eventLine("[MODE]", simModeName());
+    } else {
+      stopDrip("key");                              // ENCSW 先打断 SW3 任务，再清空
+      world.clear();
+      renderWorld(true);
+      eventLine("[ENCSW]", "clear");
+    }
   }
 }
 
@@ -766,17 +842,22 @@ static void printHelp() {
   Serial.println(F("  i [0-15]        设亮度；不带参数则报当前值。0 是最暗档，不是关屏"));
   Serial.println(F("  f [0-99]        设板面摩擦 μ_p（百分之几，例如 f 15 = 0.15）；不带参数报当前值"));
   Serial.println(F("  u [0-99]        设块-块 / 块-墙摩擦 μ（百分之几）；不带参数报当前值"));
-  Serial.println(F("  g [1-99]        设重力标度（万分之一，例如 g 40 = 0.0040）；不带参数报当前值"));
-  Serial.println(F("  w [0-400]       设转速增益（百分数，例如 w 150；0 等于停转）；不带参数报当前值"));
+  Serial.println(F("  g [1-999]       设重力标度（万分之一，例如 g 118 = 0.0118）；水模式默认 120，粒子模式默认 118，m 切换恢复默认"));
+  Serial.println(F("  w [0-400]       设转速增益（百分数，例如 w 150；0 等于停转）；水模式默认 200，粒子模式默认 100，m 切换恢复默认"));
   Serial.println(F("  t [1-3600]      设 SW3 慢速生成周期（秒，默认 60，重启恢复）；不带参数报当前值"));
+  Serial.println(F("  m [water|particles]  切换模式（保留现有粒子）；不带参数报当前模式"));
+  Serial.println(F("  a [0-99]        设内聚力（万分之一，a 10 = 0.0010；水模式默认 4）；不带参数报当前值"));
+  Serial.println(F("  j [0-100]       设键轴黏性（百分数；水模式默认 4）；不带参数报当前值"));
+  Serial.println(F("  h [0-999]       设静水压强增益（百分数，默认 100；0 = 关闭）；不带参数报当前值"));
   Serial.println(F("  s               打印状态、统计与不变量"));
   Serial.println(F("  k N             同步推进 N 帧（台面测试用，会阻塞输入）"));
-  Serial.println(F("  v plain|friction|spin [帧数]   确定性 trace，与 sim/port_trace.py 逐行对照"));
+  Serial.println(F("  v plain|friction|spin|water [帧数]   确定性 trace；前三种对照 sim/particle/port_trace.py，water 对照 sim/water/port_trace.py"));
   Serial.println(F("  ?               本清单"));
-  Serial.printf("当前：n=%u  mode=particles  intensity=%u  seed=%lu\n",
-                (unsigned)world.count(), (unsigned)mxIntensity, (unsigned long)world.seed());
-  Serial.println(F("顺时针转编码器 = 添加，逆时针 = 删除。方向反了就改 Gewu.ino 顶部的 ENCODER_SIGN。"));
-  Serial.println(F("SW3 = 清空全部粒子并立刻补一颗，之后按周期加一颗；任意微动按下或编码器转动都会打断。"));
+  Serial.printf("当前：mode=%s  n=%u  intensity=%u  seed=%lu\n",
+                simModeName(), (unsigned)world.count(), (unsigned)mxIntensity, (unsigned long)world.seed());
+  Serial.println(F("水模式 = 零摩擦 + 零恢复 + 静水压强 + 小内聚力 + 小黏性；粒子模式 = 库仑摩擦堆叠。f / u 会改当前模式的摩擦，水模式默认 0，m water 可恢复。"));
+  Serial.println(F("顺时针转编码器 = 添加，逆时针 = 删除，按下 = 清空全部粒子。方向反了就改 Gewu.ino 顶部的 ENCODER_SIGN。"));
+  Serial.println(F("SW3 = 清空全部粒子并立刻补一颗，之后按周期加一颗；SW3 重按、编码器按下或转动会打断。SW2 = 切换水 / 粒子模式（保留现有粒子），不打断任务。"));
 }
 
 static void printStatus() {
@@ -785,18 +866,19 @@ static void printStatus() {
   const gw::Stats &st = world.stats();
   const gw::Params &p = world.params();
 
-  Serial.printf("[STA] n=%u lit=%u audit=0x%08lX mask=%016llX\n",
-                (unsigned)world.count(), (unsigned)world.litCount(),
+  Serial.printf("[STA] mode=%s n=%u lit=%u audit=0x%08lX mask=%016llX\n",
+                simModeName(), (unsigned)world.count(), (unsigned)world.litCount(),
                 (unsigned long)a, (unsigned long long)m);
   Serial.printf("[STA] commits=%lu blocked=%lu wall=%lu adds=%lu removes=%lu addfail=%lu/%lu\n",
                 (unsigned long)st.commits, (unsigned long)st.blocked, (unsigned long)st.wall,
                 (unsigned long)st.adds, (unsigned long)st.removes,
                 (unsigned long)st.addFailFull, (unsigned long)st.addFailBad);
-  Serial.printf("[STA] G=%d gx=%d gy=%d gn=%d fdv=%d gscale=%.4f mup=%.2f mu=%.2f damp=%.4f vmax=%.3f\n",
+  Serial.printf("[STA] G=%d gx=%d gy=%d gn=%d fdv=%d gscale=%.4f mup=%.2f mu=%.2f damp=%.4f vmax=%.3f coh=%.4f cohdiag=%.2f cohvisc=%.2f press=%.2f\n",
                 (int)world.gravityTotalQ16(), (int)world.gravityXQ16(), (int)world.gravityYQ16(),
                 (int)world.normalQ16(), (int)world.fdvQ16(), gravityPerG,
                 fx::toFloat(world.plateFrictionQ16()), fx::toFloat(world.pairFrictionQ16()),
-                fx::toFloat(world.dampingQ16()), fx::toFloat(world.vmaxQ16()));
+                fx::toFloat(world.dampingQ16()), fx::toFloat(world.vmaxQ16()),
+                p.cohesion, p.cohesionDiag, p.cohesionDamping, p.hydrostatic);
   Serial.printf("[STA] imu=%s fail=%u gxS=%+.3f gyS=%+.3f gzS=%+.3f\n",
                 imuReady ? imuModelName(imuKind) : "NONE", (unsigned)imuFailCount,
                 lastGx, lastGy, lastGz);
@@ -831,8 +913,9 @@ static void runTrace(const char *kind, uint32_t frames) {
   const bool isSpin = eqNoCase(kind, "spin");
   const bool isFriction = eqNoCase(kind, "friction");
   const bool isPlain = eqNoCase(kind, "plain");
-  if (!isSpin && !isFriction && !isPlain) {
-    ackErr("err v plain|friction|spin");
+  const bool isWater = eqNoCase(kind, "water");
+  if (!isSpin && !isFriction && !isPlain && !isWater) {
+    ackErr("err v plain|friction|spin|water");
     return;
   }
   if (frames == 0 || frames > TRACE_MAX_FRAME) {
@@ -846,24 +929,36 @@ static void runTrace(const char *kind, uint32_t frames) {
     tp.plateFriction = 0.0;
     tp.friction = 0.2;
   }
+  if (isWater) {
+    tp.gravity = 0.0;
+    tp.gravityTotal = 0.0;
+    tp.plateFriction = 0.0;
+    tp.friction = 0.0;
+    tp.restitution = 0.0;
+    tp.cohesion = WATER_TRACE_COHESION;
+    tp.cohesionDiag = WATER_TRACE_COHESION_DIAG;
+    tp.cohesionDamping = WATER_TRACE_COHESION_DAMP;
+  }
   if (!traceWorld.init(tp)) {
     ackErr("err trace init");
     return;
   }
 
-  // 居中 4×4，行优先，与 sim/port_trace.py 的 center_cells() 顺序一致。
+  // 居中 4×4，行优先，与 sim/particle/port_trace.py 的 center_cells() 顺序一致。
   for (int y = 2; y < 6; y++) {
     for (int x = 2; x < 6; x++) traceWorld.addAt(x, y);
   }
 
   traceWorld.setFrictionAuto(true);
-  traceWorld.setGravityTotalQ16(79);
+  traceWorld.setGravityTotalQ16(isWater ? 0 : 79);
 
   if (isSpin) {
     traceWorld.setGravityVectorQ16(0, 0);
     traceWorld.setSpinQ16(0, 0, 3277, 0, 0, 0);   // 0.05 弧度/子步
   } else if (isFriction) {
     traceWorld.setGravityVectorQ16(0, 33);        // G = 79，g∥ = 33，N ≈ 72，fdv > 0
+  } else if (isWater) {
+    traceWorld.setGravityVectorQ16(0, 0);         // 零重力，只压内聚与键轴阻尼
   } else {
     traceWorld.setGravityVectorQ16(0, 79);        // 默认 fdv = 0 的场景
   }
@@ -976,8 +1071,9 @@ static void runCommand(char *line) {
     case 'g':
       if (nw > 2) { ackErr("err g N"); return; }
       if (nw == 2) {
-        if (!parseU8(w[1], 99, &a) || a == 0) { ackErr("err g 1..99"); return; }
-        gravityPerG = (double)a / 10000.0;
+        uint32_t v = 0;
+        if (!parseU32(w[1], 999, &v) || v == 0) { ackErr("err g 1..999"); return; }
+        gravityPerG = (double)v / 10000.0;
         if (!imuReady) applyFallbackGravity();   // IMU 没就绪时立刻按新标度更新回退重力；就绪时下一个 5 ms 节拍会自己刷新
       }
       {
@@ -1014,6 +1110,67 @@ static void runCommand(char *line) {
       {
         char buf[24];
         snprintf(buf, sizeof(buf), "t %lus", (unsigned long)(dripIntervalMs / 1000));
+        eventLine("[CMD]", buf);
+      }
+      break;
+
+    case 'm':
+      if (nw > 2) { ackErr("err m water|particles"); return; }
+      if (nw == 2) {
+        if (eqNoCase(w[1], "water")) {
+          applyMode(MODE_WATER);
+        } else if (eqNoCase(w[1], "particles")) {
+          applyMode(MODE_PARTICLES);
+        } else {
+          ackErr("err m water|particles");
+          return;
+        }
+      }
+      {
+        char buf[24];
+        snprintf(buf, sizeof(buf), "m %s", simModeName());
+        eventLine("[CMD]", buf);
+      }
+      break;
+
+    case 'a':
+      if (nw > 2) { ackErr("err a N"); return; }
+      if (nw == 2) {
+        uint32_t v = 0;
+        if (!parseU32(w[1], 99, &v)) { ackErr("err a 0..99"); return; }
+        world.setCohesionFloat((double)v / 10000.0);
+      }
+      {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "a %.4f", world.cohesion());
+        eventLine("[CMD]", buf);
+      }
+      break;
+
+    case 'j':
+      if (nw > 2) { ackErr("err j N"); return; }
+      if (nw == 2) {
+        uint32_t v = 0;
+        if (!parseU32(w[1], 100, &v)) { ackErr("err j 0..100"); return; }
+        world.setCohesionDampingFloat((double)v / 100.0);
+      }
+      {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "j %.2f", world.cohesionDamping());
+        eventLine("[CMD]", buf);
+      }
+      break;
+
+    case 'h':
+      if (nw > 2) { ackErr("err h N"); return; }
+      if (nw == 2) {
+        uint32_t v = 0;
+        if (!parseU32(w[1], 999, &v)) { ackErr("err h 0..999"); return; }
+        world.setHydrostaticFloat((double)v / 100.0);
+      }
+      {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "h %.2f", world.hydrostatic());
         eventLine("[CMD]", buf);
       }
       break;
@@ -1099,13 +1256,14 @@ void setup() {
 
   Serial.println();
   Serial.println(F("========================================"));
-  Serial.println(F(" Gewu 正式固件 v0.1"));
+  Serial.println(F(" Gewu 正式固件 v0.2"));
   Serial.println(F(" 板型 AirM2M CORE ESP32C3 / 串口 921600"));
   Serial.println(F(" 引擎 v2 格子锚定 / Q16.16 定点 / 8x8 / 容量 64"));
   Serial.println(F(" 物理 120 子步每秒 x 2 = 60 帧每秒"));
-  Serial.println(F(" 顺时针转编码器 = 添加粒子，逆时针 = 删除最新"));
-  Serial.println(F(" SW3 = 清空后每 60 秒加一颗，任意微动 / 编码器转动打断"));
-  Serial.println(F(" 命令：? 看清单（n 加 / d 删 / p x y 定点添加 / c 清空 / f u 摩擦 / g 重力 / w 转速增益 / s 状态 / v trace）"));
+  Serial.println(F(" 模式：水（零摩擦 + 零恢复 + 静水压强，重力 0.0120，转速增益 200% = 粒子 2×）。m particles 切回粒子模式"));
+  Serial.println(F(" 顺时针转编码器 = 添加一格水，逆时针 = 删除最新，按下 = 清空全部"));
+  Serial.println(F(" SW2 = 切换水 / 粒子模式（保留粒子），SW3 = 清空后每 60 秒加一格"));
+  Serial.println(F(" 命令：? 看清单（m 模式 / a 内聚 / j 黏性 / h 压强 / n 加 / d 删 / p x y 定点添加 / c 清空 / g 重力 / w 转速增益 / s 状态 / v trace）"));
   Serial.println(F("========================================"));
 
   mx.begin();
@@ -1125,11 +1283,24 @@ void setup() {
   encPrev = (int8_t)((digitalRead(PIN_ENCA) << 1) | digitalRead(PIN_ENCB));
 
   gw::Params p;
-  p.plateFriction = PLATE_FRICTION_INIT;
-  p.friction = PAIR_FRICTION_INIT;
+  // 每帧 4 子步、子步率 240 Hz，帧率仍是 60 Hz。只改这两项不动重力标度，屏幕上的运动速度翻倍（时间尺度从约 6.5 倍慢放收到约 3.3 倍），堆叠稳定性不变。
+  // Params 的默认值仍是 2 子步 / 120 Hz，专供 v plain|friction|spin|water 的逐位对照；两处不要混成一个默认值。
+  p.substeps = 4;
+  p.substepHz = 240.0;
+  p.plateFriction = 0.0;
+  p.friction = 0.0;
+  p.restitution = WATER_RESTITUTION;
+  p.damping = WATER_DAMPING;
+  p.cohesion = WATER_COHESION_INIT;
+  p.cohesionDiag = WATER_COHESION_DIAG;
+  p.cohesionDamping = WATER_COHESION_DAMP;
+  p.hydrostatic = WATER_HYDROSTATIC_INIT;
   if (!world.init(p)) {
     Serial.println(F("物理内核初始化失败——参数越界，检查 Gewu.ino 顶部的可调参数"));
   }
+  simMode = MODE_WATER;
+  gravityPerG = GRAVITY_PER_G_WATER;
+  spinScale = SPIN_SCALE_WATER;
   world.setSeed(esp_random());
   // 转动原点 = 加速度计的实际安装位置，不是板心。BoardProfile 里存的是引擎连续坐标（逻辑格 (4,7) 的格心）。
   world.setPivotQ16(fx::fromFloat(IMU_PIVOT_ENGINE_X), fx::fromFloat(IMU_PIVOT_ENGINE_Y));
@@ -1148,10 +1319,11 @@ void setup() {
   nextSubUs = micros();
   renderWorld(true);
 
-  Serial.printf("物理内核就绪：容量 %u，初始粒子 0，种子 %lu\n",
+  Serial.printf("物理内核就绪：容量 %u，初始粒子 0（不预置任何水格），种子 %lu\n",
                 (unsigned)gw::PhysicsWorld::MAX_BLOCKS, (unsigned long)world.seed());
-  Serial.println(F("开始：转编码器添加或删除粒子；倾斜朝低处滑，横向甩板有冲量，转板受离心力。"));
-  Serial.println(F("按 SW3 进入慢速生成：清空后立刻补一颗，之后每 60 秒加一颗；任意微动或编码器转动打断。"));
+  Serial.println(F("开始：转编码器添加或删除水格；倾斜时零摩擦让水流向低处，竖着拿时水柱会塌、液面会平。"));
+  Serial.println(F("内聚 0.0004、黏性 0.04 只负责低速时把水粘成一片，a / j 可现场改；h 调静水压强（默认 1.00），m particles 切回粒子模式。"));
+  Serial.println(F("按 SW2 切换水 / 粒子模式（保留现有粒子）；按 SW3 进入慢速生成：清空后立刻补一格，之后每 60 秒加一格。"));
   Serial.println();
 }
 
@@ -1162,11 +1334,11 @@ void loop() {
   const uint32_t nowMs = millis();
 
   pollSerial();          // 永不阻塞；命令响应越快越顺手
-  scanButtons(nowMs);    // 微动：SW3 启动慢速生成，SW2 / ENCSW 打断
+  scanButtons(nowMs);    // 微动：SW3 启动慢速生成，SW2 切换模式（不打断），ENCSW 打断并清空
   scanEncoder();         // 每轮都扫，不按模式门控
   tickDrip(nowMs);       // SW3 任务的定时加粒子
   tickImu(nowMs);        // 200 Hz 更新重力
-  tickPhysics();         // 120 Hz 子步，每 2 个子步渲染一帧
+  tickPhysics();         // 240 Hz 子步，每 4 个子步渲染一帧
 
   const uint32_t dt = micros() - loopStart;
   if (dt > loopMaxUs) loopMaxUs = dt;

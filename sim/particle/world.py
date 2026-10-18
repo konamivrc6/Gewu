@@ -14,7 +14,12 @@
 from __future__ import annotations
 
 import math
+import os
+import sys
 from dataclasses import dataclass
+
+# 脚本住在 sim/particle/，公共模块（fixed / spawn）在上一层，先把它加进搜索路径。
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import fixed
 import spawn

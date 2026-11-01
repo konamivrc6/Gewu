@@ -3,7 +3,7 @@
  * ==================================================================
  *
  * 这一版接编码器与 MPU6500 两路输入：顺时针一格在随机空白格添加一个粒子，逆时针一格删除最新添加的粒子（上限 64）；加速度计给实时重力，陀螺给三轴角速度，粒子会因倾斜滑落、因甩板获得冲量、因转板受到离心/科氏/欧拉力。IMU 没就绪时退回“平放、无平面内重力、不转动”，屏幕保持静止。
- * SW3 是演示用的慢速生成任务：按下清空全部粒子并立刻补一颗，之后每 60 秒加一颗；SW3 重按、编码器按下或转过一格都会打断它。SW2 按 水 → 粒子 → 钢珠 → 水 循环，切换保留现有粒子、只恢复该模式的默认参数，不打断这个任务，后续粒子按新模式的物理继续加。编码器按下直接清空全部粒子。
+ * SW3 是演示用的慢速生成任务：松开时清空全部粒子并立刻补一颗，之后每 60 秒加一颗；SW3 再次松开、编码器按键松开或转过一格都会打断它。SW2 松开时按 水 → 粒子 → 钢珠 → 水 循环，切换保留现有粒子、只恢复该模式的默认参数，不打断这个任务，后续粒子按新模式的物理继续加。编码器按键松开清空全部粒子。三路按键都在松开沿动作，按住期间不动，为后续组合键留出时序窗口。
  *
  * 水模式（默认为水）：板面与块间摩擦归零，只留静水压强，重力标度 0.0120，不再按倍数绑定粒子模式，转速增益取两倍（200%；离心按 ω² 长，实际是四倍）。一格一颗保证不可压缩，竖直方向上的重量沿重力反方向数出水头差，变成横向推力，所以竖柱会塌、液面会平。内聚力与键轴黏性取很小的值（a 4 / j 4）：4 mm 的格子上表面张力的毛细长度 2.7 mm、黏性边界层 0.2 mm，两者都不足一个像素，宏观形状由静水压强决定；但低速流淌时没有它们，水会散成单个格子。m particles 切回粒子模式，a / j 可现场把内聚与黏性加回来，h 调静水压强，g 调当前模式的重力标度。
  *
@@ -215,7 +215,8 @@ static int8_t  encPrev  = 0;
 static int8_t  encAccum = 0;
 static int32_t encDetent = 0;
 
-// 三路微动的消抖状态。低电平有效，按下沿才动作；松开沿不报，免得串口刷屏。
+// 三路微动的消抖状态。低电平有效，两个沿都报到串口；动作在松开沿执行——
+// 按住 A 再点一下 B 的时序里，按下时抢先动作会把组合键要用的状态弄脏。
 struct ButtonState {
   uint8_t     pin;
   const char *tag;
@@ -231,7 +232,7 @@ static ButtonState buttons[] = {
 };
 static const uint8_t BUTTON_COUNT = sizeof(buttons) / sizeof(buttons[0]);
 
-// SW3 慢速生成任务。按下清空全部粒子并立刻补一颗，之后每 dripIntervalMs 加一颗；SW3 重按、编码器按下或转过一格都会终止它，SW2 只切模式不打断（后续粒子按新模式加）。串口命令不打断，方便台面调参时让它继续跑。
+// SW3 慢速生成任务。松开时清空全部粒子并立刻补一颗，之后每 dripIntervalMs 加一颗；SW3 再次松开、编码器按下或转过一格都会终止它，SW2 只切模式不打断（后续粒子按新模式加）。串口命令不打断，方便台面调参时让它继续跑。
 static uint32_t dripIntervalMs = DRIP_INTERVAL_MS;
 static bool     dripActive  = false;
 static uint32_t dripNextMs  = 0;
@@ -725,7 +726,7 @@ static bool dripAddOne() {
   return true;
 }
 
-// 按下 SW3：清空、立刻补一颗、重置计时。任务进行中再按等于重开，所以先停旧的任务。
+// 松开 SW3：清空、立刻补一颗、重置计时。任务进行中再次松开等于重开，所以先停旧的任务。
 static void startDrip(uint32_t nowMs) {
   if (dripActive) stopDrip("restart");
   world.clear();
@@ -763,9 +764,9 @@ static void scanButtons(uint32_t nowMs) {
     if (raw == b.stable || (nowMs - b.lastEdgeMs) < DEBOUNCE_MS) continue;
 
     b.stable = raw;
-    if (!raw) continue;                             // 只处理按下沿
+    eventLine(b.tag, raw ? "press" : "release");
+    if (raw) continue;                              // 按下沿只报事件，动作留到松开
 
-    eventLine(b.tag, "press");
     if (b.pin == PIN_SW3) {
       startDrip(nowMs);
     } else if (b.pin == PIN_SW2) {
@@ -891,8 +892,8 @@ static void printHelp() {
   Serial.printf("当前：mode=%s  n=%u  intensity=%u  seed=%lu\n",
                 simModeName(), (unsigned)world.count(), (unsigned)mxIntensity, (unsigned long)world.seed());
   Serial.println(F("水 = 零摩擦 + 零恢复 + 静水压强 + 小内聚力；粒子 = 库仑摩擦堆叠；钢珠 = 低摩擦 + 高恢复的硬颗粒。f / q / u / e 改当前模式的系数，m 切换恢复该模式默认。"));
-  Serial.println(F("顺时针转编码器 = 添加，逆时针 = 删除，按下 = 清空全部粒子。方向反了就改 Gewu.ino 顶部的 ENCODER_SIGN。"));
-  Serial.println(F("SW3 = 清空全部粒子并立刻补一颗，之后按周期加一颗；SW3 重按、编码器按下或转动会打断。SW2 = 按 水 → 粒子 → 钢珠 → 水 循环（保留现有粒子），不打断任务。"));
+  Serial.println(F("顺时针转编码器 = 添加，逆时针 = 删除，编码器按键松开 = 清空全部粒子。方向反了就改 Gewu.ino 顶部的 ENCODER_SIGN。"));
+  Serial.println(F("SW3 松开 = 清空全部粒子并立刻补一颗，之后按周期加一颗；SW3 再次松开、编码器按键松开或转动会打断。SW2 松开 = 水 → 粒子 → 钢珠 → 水 循环（保留现有粒子），不打断任务。"));
 }
 
 static void printStatus() {
@@ -1327,8 +1328,8 @@ void setup() {
   Serial.println(F(" 引擎 v2 格子锚定 / Q16.16 定点 / 8x8 / 容量 64"));
   Serial.println(F(" 物理 240 子步每秒 / 每 4 子步一帧 = 60 帧每秒"));
   Serial.println(F(" 模式：水（零摩擦 + 零恢复 + 静水压强，重力 0.0120，转速增益 200%）。m particles 切粒子，m steel 切钢珠"));
-  Serial.println(F(" 顺时针转编码器 = 添加一格，逆时针 = 删除最新，按下 = 清空全部"));
-  Serial.println(F(" SW2 = 水 → 粒子 → 钢珠 循环（保留粒子），SW3 = 清空后每 60 秒加一格"));
+  Serial.println(F(" 顺时针转编码器 = 添加一格，逆时针 = 删除最新，编码器按键松开 = 清空全部"));
+  Serial.println(F(" SW2 松开 = 水 → 粒子 → 钢珠 循环（保留粒子），SW3 松开 = 清空后每 60 秒加一格"));
   Serial.println(F(" 命令：? 看清单（m 模式 / a 内聚 / j 黏性 / h 压强 / e 恢复 / q 板面摩擦 / n 加 / d 删 / p x y 定点添加 / c 清空 / g 重力 / w 转速增益 / s 状态 / v trace）"));
   Serial.println(F("========================================"));
 

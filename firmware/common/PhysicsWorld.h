@@ -76,6 +76,10 @@ static const CohesionOffset COHESION_OFFSETS[8] = {
   { 1,  1,  46341,  46341, true},
 };
 
+// 成对遍历用的半平面偏移，对应 COHESION_OFFSETS 的下标：(1,0) (0,1) (1,1) (-1,1)。
+// 每条相邻边只从一端访问一次，所以这四个方向加上各自的反向量恰好覆盖全部 8 条边，不重复也不遗漏。
+static const uint8_t COH_PAIR_IDX[4] = {4, 6, 7, 5};
+
 struct Stats {
   uint32_t commits, blocked, wall;
   uint32_t adds, removes;
@@ -189,7 +193,7 @@ class PhysicsWorld {
  private:
   uint32_t nextRand();
   bool rebuildCohesion();
-  void cohesionAccel(uint8_t i, int32_t &fx, int32_t &fy) const;
+  void cohesionPairs(int32_t *ax, int32_t *ay) const;
   void updatePressure(int32_t gx, int32_t gy);
   void buildPressureDepth();
   void pressureAccel(uint8_t i, int32_t &fx, int32_t &fy) const;
@@ -461,26 +465,47 @@ inline bool PhysicsWorld::setCohesionDampingFloat(double d) {
   return rebuildCohesion();
 }
 
-inline void PhysicsWorld::cohesionAccel(uint8_t i, int32_t &fx, int32_t &fy) const {
-  const Block &b = blocks_[i];
-  fx = 0;
-  fy = 0;
-  for (uint8_t k = 0; k < 8; k++) {
-    const CohesionOffset &o = COHESION_OFFSETS[k];
-    const int16_t nx = (int16_t)(b.cx + o.dx);
-    const int16_t ny = (int16_t)(b.cy + o.dy);
-    if (nx < 0 || nx >= (int16_t)W_ || ny < 0 || ny >= (int16_t)H_) continue;
-    const int16_t j = owner_[nx + ny * (int16_t)W_];
-    if (j < 0) continue;
-    fx = fx::add(fx, cohForce_[k][0]);
-    fy = fx::add(fy, cohForce_[k][1]);
-    if (cdamp_ != 0) {
-      const Block &o2 = blocks_[j];
-      const int32_t vrel = fx::add(fx::mul(fx::sub(b.vx, o2.vx), o.ux),
-                                   fx::mul(fx::sub(b.vy, o2.vy), o.uy));
-      const int32_t d = fx::mul(cdamp_, vrel);
-      fx = fx::sub(fx, fx::mul(d, o.ux));
-      fy = fx::sub(fy, fx::mul(d, o.uy));
+// 块与块之间的内聚力与键轴阻尼，成对施加：每条相邻边只算一次，两个块同时更新。
+//
+// 逐位等价于原来的「每个块各自扫八邻域」，依据三条：
+//   1. 定点累加是整数加法，可交换、可结合，求和顺序不影响结果；
+//   2. fx::mul() 的取整向远离零方向，严格奇，mul(−a, b) == −mul(a, b)；
+//   3. 阻尼项在反方向上恰好是同一个数：u' = −u，而 vrel' = (v_j − v_i)·u' = vrel，
+//      所以 d' = d，两个方向的推力 d·u' = −(d·u) 等大反向。
+// 力项不用额外论证：cohForce_ 里每一对相反方向的向量本来就是精确的相反数。
+//
+// 省下来的是：每条边的阻尼乘法只做一次（原来两个块各做一次），以及一半的邻格查表。
+inline void PhysicsWorld::cohesionPairs(int32_t *ax, int32_t *ay) const {
+  for (uint8_t i = 0; i < count_; i++) {
+    const Block &b = blocks_[i];
+    const int16_t cx = b.cx;
+    const int16_t cy = b.cy;
+    for (uint8_t m = 0; m < 4; m++) {
+      const uint8_t k = COH_PAIR_IDX[m];
+      const CohesionOffset &o = COHESION_OFFSETS[k];
+      const int16_t nx = (int16_t)(cx + o.dx);
+      const int16_t ny = (int16_t)(cy + o.dy);
+      if (nx < 0 || nx >= (int16_t)W_ || ny < 0 || ny >= (int16_t)H_) continue;
+      const int16_t j = owner_[nx + ny * (int16_t)W_];
+      if (j < 0) continue;
+      const int32_t cfx = cohForce_[k][0];
+      const int32_t cfy = cohForce_[k][1];
+      ax[i] = fx::add(ax[i], cfx);
+      ay[i] = fx::add(ay[i], cfy);
+      ax[j] = fx::sub(ax[j], cfx);
+      ay[j] = fx::sub(ay[j], cfy);
+      if (cdamp_ != 0) {
+        const Block &o2 = blocks_[j];
+        const int32_t vrel = fx::add(fx::mul(fx::sub(b.vx, o2.vx), o.ux),
+                                     fx::mul(fx::sub(b.vy, o2.vy), o.uy));
+        const int32_t d = fx::mul(cdamp_, vrel);
+        const int32_t jx = fx::mul(d, o.ux);
+        const int32_t jy = fx::mul(d, o.uy);
+        ax[i] = fx::sub(ax[i], jx);
+        ay[i] = fx::sub(ay[i], jy);
+        ax[j] = fx::add(ax[j], jx);
+        ay[j] = fx::add(ay[j], jy);
+      }
     }
   }
 }
@@ -718,21 +743,21 @@ inline void PhysicsWorld::substep() {
   }
 
   // 内聚力与静水压强必须先用全体块的旧状态算完，再统一施加。边算边改会让先处理到的块污染邻居用于阻尼的速度，结果会依赖块的存储顺序。
+  // 内聚走成对路径，一条边只算一次，所以结果是整场数组而不是逐块返回值；压强仍是逐块量，按「内聚在前、压强在后」叠加。
   updatePressure(gx, gy);
   const bool extraOn = (cohesionOn_ || pressActive_);
   int32_t extX[MAX_BLOCKS], extY[MAX_BLOCKS];
   if (extraOn) {
-    for (uint8_t i = 0; i < count_; i++) {
-      int32_t ex = 0, ey = 0;
-      if (cohesionOn_) cohesionAccel(i, ex, ey);
-      if (pressActive_) {
+    memset(extX, 0, sizeof(extX));
+    memset(extY, 0, sizeof(extY));
+    if (cohesionOn_) cohesionPairs(extX, extY);
+    if (pressActive_) {
+      for (uint8_t i = 0; i < count_; i++) {
         int32_t px = 0, py = 0;
         pressureAccel(i, px, py);
-        ex = fx::add(ex, px);
-        ey = fx::add(ey, py);
+        extX[i] = fx::add(extX[i], px);
+        extY[i] = fx::add(extY[i], py);
       }
-      extX[i] = ex;
-      extY[i] = ey;
     }
   }
 

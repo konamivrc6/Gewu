@@ -74,6 +74,10 @@ _COH_OFFSETS = (
     (1, 1, 46341, 46341, True),
 )
 
+# 成对遍历用的半平面偏移，对应 _COH_OFFSETS 的下标：(1,0) (0,1) (1,1) (-1,1)。
+# 每条相邻边只从一端访问一次，所以这四个方向恰好覆盖全部 8 条边，不会重复也不会漏。
+_COH_PAIR_IDX = (4, 6, 7, 5)
+
 
 class Params:
     def __init__(self, **kw):
@@ -253,7 +257,7 @@ class World2:
             pivx, pivy = self.pivx, self.pivy
         # 内聚力与静水压强必须先用全体块的旧状态算完，再统一施加。若边算边改，先处理到的块会改掉邻居用于阻尼的速度，结果依赖块的存储顺序。
         self._update_pressure(gx, gy)
-        extra = ([self._extra_accel(i) for i in range(len(self.blocks))]
+        extra = (self._extra_accels()
                  if (self.cohesion_on or self.press_active) else None)
         for i, b in enumerate(self.blocks):
             if spin:
@@ -266,15 +270,15 @@ class World2:
                 ax = add(add(gx, cx), add(mul(twz, b.vy), mul(wdz, ry)))
                 ay = sub(add(gy, cy), add(mul(twz, b.vx), mul(wdz, rx)))
                 if extra is not None:
-                    ax = add(ax, extra[i][0])
-                    ay = add(ay, extra[i][1])
+                    ax = add(ax, extra[0][i])
+                    ay = add(ay, extra[1][i])
                 b.vx = clamp(mul(add(b.vx, ax), self.damp), -self.vmax, self.vmax)
                 b.vy = clamp(mul(add(b.vy, ay), self.damp), -self.vmax, self.vmax)
             else:
                 ax, ay = gx, gy
                 if extra is not None:
-                    ax = add(ax, extra[i][0])
-                    ay = add(ay, extra[i][1])
+                    ax = add(ax, extra[0][i])
+                    ay = add(ay, extra[1][i])
                 b.vx = clamp(mul(add(b.vx, ax), self.damp), -self.vmax, self.vmax)
                 b.vy = clamp(mul(add(b.vy, ay), self.damp), -self.vmax, self.vmax)
             # 板面摩擦在跨格门之前：它是体表力，和后面格子面上的法向冲量是两回事
@@ -307,40 +311,70 @@ class World2:
             for ax in axes:
                 self._gate(i, ax)
 
-    def _cohesion(self, i: int):
-        """单块的内聚 + 浸润 + 键轴阻尼，返回本子步要施加的加速度（Q16.16）。
+    def _cohesion_wall(self, i: int):
+        """单块的壁面项：越界虚拟水格的浸润力 + 接触线力，返回 (fx, fy)。
 
-        方向只取格偏移，不取粒子的连续位置。这是刻意的：八邻域全满时八个单位向量之和严格为零，所以净力只出现在边界；形变也不改变键的方向，体内因此没有剪切刚度。若改用连续位置归一化，水会获得弹性，容易变成一块会滑动的固体。
-
-        越界邻居当作虚拟水格，强度是 cohesion·wetting。平直壁面上三个虚拟格的切向分量相消，净力只剩法向；角上的合力指向角平分线。
-
-        阻尼沿键轴取相对速度，等大反作用于两端。每个粒子每子步会被最多八个邻居各阻尼一次，所以系数要取小值，0.02 量级已经很明显。
+        内部块（1 ≤ cx ≤ W−2 且 1 ≤ cy ≤ H−2）没有越界邻居，接触线力也不在壁面格上作用，直接返回零。
+        这一项与块对之间的相互作用无关，所以留在逐块的路径里；下面 _cohesion_pairs() 只管块与块之间的边。
         """
         b = self.blocks[i]
-        own = self.owner
         W, H = self.W, self.H
+        if 0 < b.cx < W - 1 and 0 < b.cy < H - 1:
+            return 0, 0
         fx = 0
         fy = 0
-        for (dx, dy, ux, uy, _diag), (cfx, cfy), (wfx, wfy) in zip(_COH_OFFSETS, self.coh_force, self.wet_force):
+        for (dx, dy, _ux, _uy, _diag), (wfx, wfy) in zip(_COH_OFFSETS, self.wet_force):
             nx = b.cx + dx
             ny = b.cy + dy
-            if 0 <= nx < W and 0 <= ny < H:
-                j = own[nx + ny * W]
-                if j < 0:
-                    continue
-                fx = add(fx, cfx)
-                fy = add(fy, cfy)
-                if self.cdamp != 0:
-                    o = self.blocks[j]
-                    vrel = add(mul(sub(b.vx, o.vx), ux), mul(sub(b.vy, o.vy), uy))
-                    d = mul(self.cdamp, vrel)
-                    fx = sub(fx, mul(d, ux))
-                    fy = sub(fy, mul(d, uy))
-            else:
+            if not (0 <= nx < W and 0 <= ny < H):
                 fx = add(fx, wfx)
                 fy = add(fy, wfy)
         lx, ly = self._contact_line(b)
         return add(fx, lx), add(fy, ly)
+
+    def _cohesion_pairs(self, ax, ay):
+        """块与块之间的内聚力与键轴阻尼，成对施加：每条相邻边只算一次，两个块同时更新。
+
+        逐位等价于「每个块各自扫八邻域」，依据三条：
+          1. 定点累加是整数加法，可交换、可结合，求和顺序不影响结果；
+          2. mul() 的取整是向远离零的方向，严格奇，mul(−a, b) == −mul(a, b)；
+          3. 阻尼项在反方向上恰好是同一个数：u' = −u，而 vrel' = (v_j − v_i)·u' = vrel，所以 d' = d，
+             两个方向的推力 d·u' = −(d·u) 等大反向。
+        力项不用额外论证：coh_force 里每一对相反方向的向量本来就是精确的相反数。
+        """
+        own = self.owner
+        W, H = self.W, self.H
+        blocks = self.blocks
+        cdamp = self.cdamp
+        for i, b in enumerate(blocks):
+            cx = b.cx
+            cy = b.cy
+            vx = b.vx
+            vy = b.vy
+            for k in _COH_PAIR_IDX:
+                dx, dy, ux, uy, _diag = _COH_OFFSETS[k]
+                nx = cx + dx
+                ny = cy + dy
+                if not (0 <= nx < W and 0 <= ny < H):
+                    continue
+                j = own[nx + ny * W]
+                if j < 0:
+                    continue
+                o = blocks[j]
+                cfx, cfy = self.coh_force[k]
+                ax[i] = add(ax[i], cfx)
+                ay[i] = add(ay[i], cfy)
+                ax[j] = sub(ax[j], cfx)
+                ay[j] = sub(ay[j], cfy)
+                if cdamp != 0:
+                    vrel = add(mul(sub(vx, o.vx), ux), mul(sub(vy, o.vy), uy))
+                    d = mul(cdamp, vrel)
+                    jx = mul(d, ux)          # 只算一次，两个方向的推力就是这个向量及其反号
+                    jy = mul(d, uy)
+                    ax[i] = sub(ax[i], jx)
+                    ay[i] = sub(ay[i], jy)
+                    ax[j] = add(ax[j], jx)
+                    ay[j] = add(ay[j], jy)
 
     def _is_water(self, x: int, y: int) -> bool:
         return 0 <= x < self.W and 0 <= y < self.H and self.owner[x + y * self.W] >= 0
@@ -465,16 +499,29 @@ class World2:
                 ay = add(ay, mul(f, sy))
         return ax, ay
 
-    def _extra_accel(self, i: int):
-        """内聚 + 静水压强，合并成一次加进子步的加速度。两者都只依赖子步开始时的状态。"""
-        fx = fy = 0
+    def _extra_accels(self):
+        """全场的额外加速度：内聚（壁面项 + 成对项）与静水压强，返回两个列表。
+
+        必须先用全体块的旧状态算完再统一施加——先算的块不能污染后算的块用到的速度。
+        改成返回全场数组是因为内聚要走成对路径：每条边只能算一次，就不能再按块独立返回。
+        压强仍是逐块量，叠加顺序与原来一致（内聚在前、压强在后）；整数加法可交换，结果逐位不变。
+        """
+        n = len(self.blocks)
+        ax = [0] * n
+        ay = [0] * n
         if self.cohesion_on:
-            fx, fy = self._cohesion(i)
+            for i in range(n):
+                wx, wy = self._cohesion_wall(i)
+                if wx or wy:
+                    ax[i] = wx
+                    ay[i] = wy
+            self._cohesion_pairs(ax, ay)
         if self.press_active:
-            px, py = self._pressure(i)
-            fx = add(fx, px)
-            fy = add(fy, py)
-        return fx, fy
+            for i in range(n):
+                px, py = self._pressure(i)
+                ax[i] = add(ax[i], px)
+                ay[i] = add(ay[i], py)
+        return ax, ay
 
     def _contact_line(self, b: Block):
         """接触线力：沿壁面指向背离液体的一侧。

@@ -157,6 +157,8 @@ class PhysicsWorld {
   void setRestitutionQ16(int32_t e) { e_ = e; }
   void setRestitutionSlopQ16(int32_t s) { eslop_ = s; }
   void setDampingQ16(int32_t d) { damp_ = d; }
+  // e 只存在 e_ 里、不回写 p_.restitution，所以读当前值必须走这个 getter，不能读 params()。
+  int32_t restitutionQ16() const { return e_; }
   // ---------- 内聚（水模式） ----------
   bool setCohesionFloat(double c);
   bool setCohesionDiagFloat(double d);

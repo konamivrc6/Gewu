@@ -1,11 +1,13 @@
 /*
- * Gewu 正式固件 v0.2 —— 格子锚定物理内核 + 水 / 粒子双模式
- * ========================================================
+ * Gewu 正式固件 v0.2 —— 格子锚定物理内核 + 水 / 粒子 / 钢珠三模式
+ * ==================================================================
  *
  * 这一版接编码器与 MPU6500 两路输入：顺时针一格在随机空白格添加一个粒子，逆时针一格删除最新添加的粒子（上限 64）；加速度计给实时重力，陀螺给三轴角速度，粒子会因倾斜滑落、因甩板获得冲量、因转板受到离心/科氏/欧拉力。IMU 没就绪时退回“平放、无平面内重力、不转动”，屏幕保持静止。
- * SW3 是演示用的慢速生成任务：按下清空全部粒子并立刻补一颗，之后每 60 秒加一颗；SW3 重按、编码器按下或转过一格都会打断它。SW2 切换水 / 粒子模式，切换保留现有粒子、只恢复该模式的默认参数，不打断这个任务，后续粒子按新模式的物理继续加。编码器按下直接清空全部粒子。
+ * SW3 是演示用的慢速生成任务：按下清空全部粒子并立刻补一颗，之后每 60 秒加一颗；SW3 重按、编码器按下或转过一格都会打断它。SW2 按 水 → 粒子 → 钢珠 → 水 循环，切换保留现有粒子、只恢复该模式的默认参数，不打断这个任务，后续粒子按新模式的物理继续加。编码器按下直接清空全部粒子。
  *
- * 水模式（feat/water 分支默认）：板面与块间摩擦归零，只留静水压强，重力标度 0.0120，不再按倍数绑定粒子模式，转速增益取两倍（200%；离心按 ω² 长，实际是四倍）。一格一颗保证不可压缩，竖直方向上的重量沿重力反方向数出水头差，变成横向推力，所以竖柱会塌、液面会平。内聚力与键轴黏性取很小的值（a 4 / j 4）：4 mm 的格子上表面张力的毛细长度 2.7 mm、黏性边界层 0.2 mm，两者都不足一个像素，宏观形状由静水压强决定；但低速流淌时没有它们，水会散成单个格子。m particles 切回粒子模式，a / j 可现场把内聚与黏性加回来，h 调静水压强，g 调当前模式的重力标度。
+ * 水模式（默认为水）：板面与块间摩擦归零，只留静水压强，重力标度 0.0120，不再按倍数绑定粒子模式，转速增益取两倍（200%；离心按 ω² 长，实际是四倍）。一格一颗保证不可压缩，竖直方向上的重量沿重力反方向数出水头差，变成横向推力，所以竖柱会塌、液面会平。内聚力与键轴黏性取很小的值（a 4 / j 4）：4 mm 的格子上表面张力的毛细长度 2.7 mm、黏性边界层 0.2 mm，两者都不足一个像素，宏观形状由静水压强决定；但低速流淌时没有它们，水会散成单个格子。m particles 切回粒子模式，a / j 可现场把内聚与黏性加回来，h 调静水压强，g 调当前模式的重力标度。
+ *
+ * 钢珠模式：与粒子模式共用同一内核与同一重力标度，只把板面摩擦压到 0.003（滚动阻力系数量级）、块间摩擦压到 0.15（干态钢-钢滑动）、恢复系数提到 0.78、阻尼提到 0.9999。方块不会滚，低 μ_p 仍是在等效那个缺失的滚动自由度；密度不进入自由落体，所以「钢珠更重」不能用更大的重力标度表达，只能靠低摩擦与高恢复。e 可以现场用 e N 调（百分数），便于台面在 0.70~0.82 之间扫。
  *
  * 物理内核在 ../common/PhysicsWorld.h，逐位移植自 sim/world2.py；定点原语在 ../common/fixed_q16.h。这个草图只做三件事：读传感器、把输入翻译成增删与转动、把格号画到点阵上。
  *
@@ -103,6 +105,16 @@ static const double   PARTICLE_RESTITUTION = 0.50;
 // 水模式保持 0.9995：内聚力归零后它成了唯一的耗散，负责液面晃荡的衰减。真实水在 32 mm 容器里的晃荡衰减时间约 8 秒，慢放 1.9 倍后大致对得上。
 static const double   PARTICLE_DAMPING = 0.9998;
 static const double   WATER_DAMPING    = 0.9995;
+// 钢珠模式：GCr15 轴承钢，Ø4 mm（一格一颗），干态。质量 0.262 g；密度不影响自由落体，
+// 所以重力标度仍取粒子的 0.0118，手感靠低摩擦与高恢复，不能靠更大的 g。
+// μ_p = 0.003 对应钢球在硬质光滑面上的滚动阻力系数（0.001~0.005）；方块不会滚，这个低值就是在等效滚动。
+// μ = 0.15 对应干态钢-钢滑动摩擦（0.15~0.20）的低端；方块互锁比圆球强，实际堆角会比 8.5° 高。
+// e = 0.78 是 0.4 m/s 下钢-钢（约 0.80）与钢-硬质塑料墙（约 0.6~0.7）的折中；现场可用 e N 在 0.70~0.82 间扫。
+// damping 0.9999：Ø4 mm 钢珠的空气阻力时间常数约 69 s，240 Hz 下 65529/65536 对应约 74 s，是最接近的一档。
+static const double   STEEL_PLATE_FRICTION = 0.003;
+static const double   STEEL_PAIR_FRICTION  = 0.15;
+static const double   STEEL_RESTITUTION    = 0.78;
+static const double   STEEL_DAMPING        = 0.9999;
 static const uint32_t I2C_HZ          = 400000;
 static const uint32_t K_MAX           = 60000;    // k 命令一次最多推进多少帧，防止串口挂死
 static const uint32_t TRACE_MAX_FRAME = 5000;
@@ -123,7 +135,8 @@ enum EncFunction : uint8_t {
 };
 static uint8_t encFunction = ENC_FN_PARTICLES;
 
-enum SimMode : uint8_t { MODE_WATER = 0, MODE_PARTICLES = 1 };
+// SW2 按这个枚举的顺序循环：水 → 粒子 → 钢珠 → 水。改顺序就改这里，别在按键分支里另写一套。
+enum SimMode : uint8_t { MODE_WATER = 0, MODE_PARTICLES = 1, MODE_STEEL = 2, MODE_COUNT = 3 };
 static uint8_t simMode = MODE_WATER;
 
 // ============================ 对象与状态 ============================
@@ -177,7 +190,13 @@ struct ImuRaw {
 enum ImuKind : uint8_t { IMU_NONE = 0, IMU_6050 = 1, IMU_6500 = 2 };
 
 // 放在 ImuRaw 之后：Arduino 的自动原型会插在第一个函数之前，函数放得太靠前会把原型顶到 struct ImuRaw 之前。
-static const char *simModeName() { return simMode == MODE_WATER ? "water" : "particles"; }
+static const char *simModeName() {
+  switch (simMode) {
+    case MODE_WATER: return "water";
+    case MODE_STEEL: return "steel";
+    default:         return "particles";
+  }
+}
 
 // 串口行缓冲。和自检草图同一套：超长整行丢掉，只报一次错。
 static char    lineBuf[SERIAL_LINE_MAX];
@@ -613,30 +632,43 @@ static void renderWorld(bool force) {
   }
 }
 
-// 模式切换只改参数，不重建内核，种子与转动原点保持不变，也不清空现有粒子——同一个初态可以直接看两种物理的差别。
+// 模式切换只改参数，不重建内核，种子与转动原点保持不变，也不清空现有粒子——同一个初态可以直接看三种物理的差别。
 static void applyMode(uint8_t mode) {
+  if (mode >= MODE_COUNT) mode = MODE_WATER;
   simMode = mode;
   gravityPerG = (mode == MODE_WATER) ? GRAVITY_PER_G_WATER : GRAVITY_PER_G_INIT;
   spinScale = (mode == MODE_WATER) ? SPIN_SCALE_WATER : SPIN_SCALE_INIT;
-  if (mode == MODE_WATER) {
-    world.setPlateFrictionQ16(0);
-    world.setPairFrictionQ16(0);
-    world.setRestitutionQ16(fx::fromFloat(WATER_RESTITUTION));
-    world.setCohesionFloat(WATER_COHESION_INIT);
-    world.setCohesionDiagFloat(WATER_COHESION_DIAG);
-    world.setCohesionDampingFloat(WATER_COHESION_DAMP);
-    world.setHydrostaticFloat(WATER_HYDROSTATIC_INIT);
-    world.setDampingQ16(fx::fromFloat(WATER_DAMPING));
-  } else {
-    world.setPlateFrictionQ16(fx::fromFloat(PLATE_FRICTION_INIT));
-    world.setPairFrictionQ16(fx::fromFloat(PAIR_FRICTION_INIT));
-    world.setRestitutionQ16(fx::fromFloat(PARTICLE_RESTITUTION));
-    world.setDampingQ16(fx::fromFloat(PARTICLE_DAMPING));
-    world.setCohesionFloat(0.0);
-    world.setCohesionDampingFloat(0.0);
-    world.setHydrostaticFloat(0.0);
+  switch (mode) {
+    case MODE_WATER:
+      world.setPlateFrictionQ16(0);
+      world.setPairFrictionQ16(0);
+      world.setRestitutionQ16(fx::fromFloat(WATER_RESTITUTION));
+      world.setCohesionFloat(WATER_COHESION_INIT);
+      world.setCohesionDiagFloat(WATER_COHESION_DIAG);
+      world.setCohesionDampingFloat(WATER_COHESION_DAMP);
+      world.setHydrostaticFloat(WATER_HYDROSTATIC_INIT);
+      world.setDampingQ16(fx::fromFloat(WATER_DAMPING));
+      break;
+    case MODE_STEEL:
+      world.setPlateFrictionQ16(fx::fromFloat(STEEL_PLATE_FRICTION));
+      world.setPairFrictionQ16(fx::fromFloat(STEEL_PAIR_FRICTION));
+      world.setRestitutionQ16(fx::fromFloat(STEEL_RESTITUTION));
+      world.setDampingQ16(fx::fromFloat(STEEL_DAMPING));
+      world.setCohesionFloat(0.0);
+      world.setCohesionDampingFloat(0.0);
+      world.setHydrostaticFloat(0.0);
+      break;
+    default:   // MODE_PARTICLES
+      world.setPlateFrictionQ16(fx::fromFloat(PLATE_FRICTION_INIT));
+      world.setPairFrictionQ16(fx::fromFloat(PAIR_FRICTION_INIT));
+      world.setRestitutionQ16(fx::fromFloat(PARTICLE_RESTITUTION));
+      world.setDampingQ16(fx::fromFloat(PARTICLE_DAMPING));
+      world.setCohesionFloat(0.0);
+      world.setCohesionDampingFloat(0.0);
+      world.setHydrostaticFloat(0.0);
+      break;
   }
-  // 按新模式的重力标度立刻刷新；IMU 就绪时下一个 5 ms 节拍会用真实姿态覆盖。切换模式本来就会清空粒子，停转没有副作用。
+  // 按新模式的重力标度立刻刷新；IMU 就绪时下一个 5 ms 节拍会用真实姿态覆盖。切换模式不清空粒子，停转没有副作用。
   applyFallbackGravity();
   renderWorld(true);
 }
@@ -738,7 +770,8 @@ static void scanButtons(uint32_t nowMs) {
       startDrip(nowMs);
     } else if (b.pin == PIN_SW2) {
       // SW2 只切模式，不打断 SW3 任务：applyMode 保留现有粒子，慢速生成继续按新模式加。
-      const uint8_t next = (simMode == MODE_WATER) ? MODE_PARTICLES : MODE_WATER;
+      // 循环顺序由 SimMode 枚举决定：水 → 粒子 → 钢珠 → 水。
+      const uint8_t next = (uint8_t)((simMode + 1) % MODE_COUNT);
       applyMode(next);                              // 切换保留现有粒子，只恢复该模式的默认参数
       eventLine("[MODE]", simModeName());
     } else {
@@ -840,12 +873,14 @@ static void printHelp() {
   Serial.println(F("  p x y           在逻辑坐标 (x,y) 添加一个粒子，用于确定性摆位"));
   Serial.println(F("  c               清空所有粒子"));
   Serial.println(F("  i [0-15]        设亮度；不带参数则报当前值。0 是最暗档，不是关屏"));
-  Serial.println(F("  f [0-99]        设板面摩擦 μ_p（百分之几，例如 f 15 = 0.15）；不带参数报当前值"));
+  Serial.println(F("  f [0-99]        设板面摩擦 μ_p（百分之几，例如 f 15 = 0.15）；步长 0.01，钢珠的 0.003 请用 q；不带参数报当前值"));
+  Serial.println(F("  q [0-999]       设板面摩擦 μ_p（千分之一，例如 q 3 = 0.003；钢珠默认 3，豆子 50）；不带参数报当前值"));
   Serial.println(F("  u [0-99]        设块-块 / 块-墙摩擦 μ（百分之几）；不带参数报当前值"));
-  Serial.println(F("  g [1-999]       设重力标度（万分之一，例如 g 118 = 0.0118）；水模式默认 120，粒子模式默认 118，m 切换恢复默认"));
-  Serial.println(F("  w [0-400]       设转速增益（百分数，例如 w 150；0 等于停转）；水模式默认 200，粒子模式默认 100，m 切换恢复默认"));
+  Serial.println(F("  e [0-100]       设恢复系数（百分数，例如 e 78 = 0.78；钢珠默认 78）；不带参数报当前值"));
+  Serial.println(F("  g [1-999]       设重力标度（万分之一，例如 g 118 = 0.0118）；水模式默认 120，粒子与钢珠默认 118，m 切换恢复默认"));
+  Serial.println(F("  w [0-400]       设转速增益（百分数，例如 w 150；0 等于停转）；水模式默认 200，粒子与钢珠默认 100，m 切换恢复默认"));
   Serial.println(F("  t [1-3600]      设 SW3 慢速生成周期（秒，默认 60，重启恢复）；不带参数报当前值"));
-  Serial.println(F("  m [water|particles]  切换模式（保留现有粒子）；不带参数报当前模式"));
+  Serial.println(F("  m [water|particles|steel]  切换模式（保留现有粒子）；不带参数报当前模式"));
   Serial.println(F("  a [0-99]        设内聚力（万分之一，a 10 = 0.0010；水模式默认 4）；不带参数报当前值"));
   Serial.println(F("  j [0-100]       设键轴黏性（百分数；水模式默认 4）；不带参数报当前值"));
   Serial.println(F("  h [0-999]       设静水压强增益（百分数，默认 100；0 = 关闭）；不带参数报当前值"));
@@ -855,9 +890,9 @@ static void printHelp() {
   Serial.println(F("  ?               本清单"));
   Serial.printf("当前：mode=%s  n=%u  intensity=%u  seed=%lu\n",
                 simModeName(), (unsigned)world.count(), (unsigned)mxIntensity, (unsigned long)world.seed());
-  Serial.println(F("水模式 = 零摩擦 + 零恢复 + 静水压强 + 小内聚力 + 小黏性；粒子模式 = 库仑摩擦堆叠。f / u 会改当前模式的摩擦，水模式默认 0，m water 可恢复。"));
+  Serial.println(F("水 = 零摩擦 + 零恢复 + 静水压强 + 小内聚力；粒子 = 库仑摩擦堆叠；钢珠 = 低摩擦 + 高恢复的硬颗粒。f / q / u / e 改当前模式的系数，m 切换恢复该模式默认。"));
   Serial.println(F("顺时针转编码器 = 添加，逆时针 = 删除，按下 = 清空全部粒子。方向反了就改 Gewu.ino 顶部的 ENCODER_SIGN。"));
-  Serial.println(F("SW3 = 清空全部粒子并立刻补一颗，之后按周期加一颗；SW3 重按、编码器按下或转动会打断。SW2 = 切换水 / 粒子模式（保留现有粒子），不打断任务。"));
+  Serial.println(F("SW3 = 清空全部粒子并立刻补一颗，之后按周期加一颗；SW3 重按、编码器按下或转动会打断。SW2 = 按 水 → 粒子 → 钢珠 → 水 循环（保留现有粒子），不打断任务。"));
 }
 
 static void printStatus() {
@@ -873,10 +908,11 @@ static void printStatus() {
                 (unsigned long)st.commits, (unsigned long)st.blocked, (unsigned long)st.wall,
                 (unsigned long)st.adds, (unsigned long)st.removes,
                 (unsigned long)st.addFailFull, (unsigned long)st.addFailBad);
-  Serial.printf("[STA] G=%d gx=%d gy=%d gn=%d fdv=%d gscale=%.4f mup=%.2f mu=%.2f damp=%.4f vmax=%.3f coh=%.4f cohdiag=%.2f cohvisc=%.2f press=%.2f\n",
+  Serial.printf("[STA] G=%d gx=%d gy=%d gn=%d fdv=%d gscale=%.4f mup=%.4f mu=%.2f e=%.2f damp=%.4f vmax=%.3f coh=%.4f cohdiag=%.2f cohvisc=%.2f press=%.2f\n",
                 (int)world.gravityTotalQ16(), (int)world.gravityXQ16(), (int)world.gravityYQ16(),
                 (int)world.normalQ16(), (int)world.fdvQ16(), gravityPerG,
                 fx::toFloat(world.plateFrictionQ16()), fx::toFloat(world.pairFrictionQ16()),
+                fx::toFloat(world.restitutionQ16()),
                 fx::toFloat(world.dampingQ16()), fx::toFloat(world.vmaxQ16()),
                 p.cohesion, p.cohesionDiag, p.cohesionDamping, p.hydrostatic);
   Serial.printf("[STA] imu=%s fail=%u gxS=%+.3f gyS=%+.3f gzS=%+.3f\n",
@@ -1055,6 +1091,21 @@ static void runCommand(char *line) {
       }
       break;
 
+    case 'q':
+      // 千分之一分辨率：钢珠的 μ_p = 0.003 低于 f 命令的 0.01 步长，台面调参必须走这里。
+      if (nw > 2) { ackErr("err q N"); return; }
+      if (nw == 2) {
+        uint32_t v = 0;
+        if (!parseU32(w[1], 999, &v)) { ackErr("err q 0..999"); return; }
+        world.setPlateFrictionQ16(fx::fromFloat((double)v / 1000.0));
+      }
+      {
+        char buf[24];
+        snprintf(buf, sizeof(buf), "q mu_p=%.4f", fx::toFloat(world.plateFrictionQ16()));
+        eventLine("[CMD]", buf);
+      }
+      break;
+
     case 'u':
       if (nw > 2) { ackErr("err u N"); return; }
       if (nw == 2) {
@@ -1064,6 +1115,19 @@ static void runCommand(char *line) {
       {
         char buf[24];
         snprintf(buf, sizeof(buf), "u mu=%.2f", fx::toFloat(world.pairFrictionQ16()));
+        eventLine("[CMD]", buf);
+      }
+      break;
+
+    case 'e':
+      if (nw > 2) { ackErr("err e N"); return; }
+      if (nw == 2) {
+        if (!parseU8(w[1], 100, &a)) { ackErr("err e 0..100"); return; }
+        world.setRestitutionQ16(fx::fromFloat((double)a / 100.0));
+      }
+      {
+        char buf[24];
+        snprintf(buf, sizeof(buf), "e %.2f", fx::toFloat(world.restitutionQ16()));
         eventLine("[CMD]", buf);
       }
       break;
@@ -1115,14 +1179,16 @@ static void runCommand(char *line) {
       break;
 
     case 'm':
-      if (nw > 2) { ackErr("err m water|particles"); return; }
+      if (nw > 2) { ackErr("err m water|particles|steel"); return; }
       if (nw == 2) {
         if (eqNoCase(w[1], "water")) {
           applyMode(MODE_WATER);
         } else if (eqNoCase(w[1], "particles")) {
           applyMode(MODE_PARTICLES);
+        } else if (eqNoCase(w[1], "steel")) {
+          applyMode(MODE_STEEL);
         } else {
-          ackErr("err m water|particles");
+          ackErr("err m water|particles|steel");
           return;
         }
       }
@@ -1259,11 +1325,11 @@ void setup() {
   Serial.println(F(" Gewu 正式固件 v0.2"));
   Serial.println(F(" 板型 AirM2M CORE ESP32C3 / 串口 921600"));
   Serial.println(F(" 引擎 v2 格子锚定 / Q16.16 定点 / 8x8 / 容量 64"));
-  Serial.println(F(" 物理 120 子步每秒 x 2 = 60 帧每秒"));
-  Serial.println(F(" 模式：水（零摩擦 + 零恢复 + 静水压强，重力 0.0120，转速增益 200% = 粒子 2×）。m particles 切回粒子模式"));
-  Serial.println(F(" 顺时针转编码器 = 添加一格水，逆时针 = 删除最新，按下 = 清空全部"));
-  Serial.println(F(" SW2 = 切换水 / 粒子模式（保留粒子），SW3 = 清空后每 60 秒加一格"));
-  Serial.println(F(" 命令：? 看清单（m 模式 / a 内聚 / j 黏性 / h 压强 / n 加 / d 删 / p x y 定点添加 / c 清空 / g 重力 / w 转速增益 / s 状态 / v trace）"));
+  Serial.println(F(" 物理 240 子步每秒 / 每 4 子步一帧 = 60 帧每秒"));
+  Serial.println(F(" 模式：水（零摩擦 + 零恢复 + 静水压强，重力 0.0120，转速增益 200%）。m particles 切粒子，m steel 切钢珠"));
+  Serial.println(F(" 顺时针转编码器 = 添加一格，逆时针 = 删除最新，按下 = 清空全部"));
+  Serial.println(F(" SW2 = 水 → 粒子 → 钢珠 循环（保留粒子），SW3 = 清空后每 60 秒加一格"));
+  Serial.println(F(" 命令：? 看清单（m 模式 / a 内聚 / j 黏性 / h 压强 / e 恢复 / q 板面摩擦 / n 加 / d 删 / p x y 定点添加 / c 清空 / g 重力 / w 转速增益 / s 状态 / v trace）"));
   Serial.println(F("========================================"));
 
   mx.begin();
@@ -1321,9 +1387,10 @@ void setup() {
 
   Serial.printf("物理内核就绪：容量 %u，初始粒子 0（不预置任何水格），种子 %lu\n",
                 (unsigned)gw::PhysicsWorld::MAX_BLOCKS, (unsigned long)world.seed());
-  Serial.println(F("开始：转编码器添加或删除水格；倾斜时零摩擦让水流向低处，竖着拿时水柱会塌、液面会平。"));
-  Serial.println(F("内聚 0.0004、黏性 0.04 只负责低速时把水粘成一片，a / j 可现场改；h 调静水压强（默认 1.00），m particles 切回粒子模式。"));
-  Serial.println(F("按 SW2 切换水 / 粒子模式（保留现有粒子）；按 SW3 进入慢速生成：清空后立刻补一格，之后每 60 秒加一格。"));
+  Serial.println(F("开始：转编码器添加或删除格子；倾斜时零摩擦让水流向低处，竖着拿时水柱会塌、液面会平。"));
+  Serial.println(F("内聚 0.0004、黏性 0.04 只负责低速时把水粘成一片，a / j 可现场改；h 调静水压强（默认 1.00）。"));
+  Serial.println(F("m particles 切豆子（μ_p 0.05、μ 0.45、e 0.50），m steel 切钢珠（μ_p 0.003、μ 0.15、e 0.78）；q / u / e 可现场改当前模式的系数。"));
+  Serial.println(F("按 SW2 按 水 → 粒子 → 钢珠 循环（保留现有粒子）；按 SW3 进入慢速生成：清空后立刻补一格，之后每 60 秒加一格。"));
   Serial.println();
 }
 

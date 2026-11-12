@@ -3,7 +3,7 @@
  * ==================================================================
  *
  * 这一版接编码器与 MPU6500 两路输入：顺时针一格在随机空白格添加一个粒子，逆时针一格删除最新添加的粒子（上限 64）；加速度计给实时重力，陀螺给三轴角速度，粒子会因倾斜滑落、因甩板获得冲量、因转板受到离心/科氏/欧拉力。IMU 没就绪时退回“平放、无平面内重力、不转动”，屏幕保持静止。
- * SW3 是演示用的慢速生成任务：松开时清空全部粒子并立刻补一颗，之后每 60 秒加一颗；SW3 再次松开、编码器按键松开或转过一格都会打断它。SW2 松开时在 水 ↔ 钢珠 之间循环，切换保留现有粒子、只恢复该模式的默认参数，不打断这个任务，后续粒子按新模式的物理继续加。红豆预设不给按键入口，只能用串口 m particles 切进去；从红豆按 SW2 回到水。编码器按键松开清空全部粒子。三路按键都在松开沿动作，按住期间不动，为后续组合键留出时序窗口。
+ * SW3 改为按住冻结：消抖确认的按下沿暂停全部物理推进，松开沿恢复；冻结期间编码器增删照常，新增粒子立刻显示但停在原地，计时任务照常计时。SW2 短按（松开沿）在 水 ↔ 钢珠 之间循环，切换保留现有粒子、只恢复该模式的默认参数，不打断计时；按住满 2 秒时先让最外圈 28 颗闪 120 ms，随后进入计时模式——清空全部粒子、立刻补一颗、之后每 60 秒加一颗，长按后松开不再切模式。计时模式被编码器转过一格或编码器按键松开打断，SW2 短按与 SW3 冻结/恢复不打断。红豆预设不给按键入口，只能用串口 m particles 切进去；从红豆按 SW2 回到水。编码器按键松开清空全部粒子。
  *
  * 水模式（默认为水）：板面与块间摩擦归零，只留静水压强，重力标度 0.0120，不再按倍数绑定红豆模式，转速增益取两倍（200%；离心按 ω² 长，实际是四倍）。一格一颗保证不可压缩，竖直方向上的重量沿重力反方向数出水头差，变成横向推力，所以竖柱会塌、液面会平。内聚力与键轴黏性取很小的值（a 4 / j 4）：4 mm 的格子上表面张力的毛细长度 2.7 mm、黏性边界层 0.2 mm，两者都不足一个像素，宏观形状由静水压强决定；但低速流淌时没有它们，水会散成单个格子。m particles 切回红豆模式，a / j 可现场把内聚与黏性加回来，h 调静水压强，g 调当前模式的重力标度。
  *
@@ -62,7 +62,12 @@ static const uint32_t SUBSTEP_US      = 4167;     // 240 Hz 子步，1e6 / 240 �
 static const uint8_t  MAX_CATCHUP     = 8;        // 一次 loop 最多补 8 个子步，约 33 ms
 // 微动消抖。硬件已各配 4.7k 上拉与 100nF（硬件接线.md 5.5 / 6.3），软件只补一道 15 ms 稳定确认。
 static const uint32_t DEBOUNCE_MS     = 15;
-// SW3 慢速生成任务的默认周期。串口 t N 可临时改，重启回到这里。
+// SW2 长按阈值。从消抖确认的按下沿起算，满 2 s 那一圈就触发，不等松开。
+// 2 s 让「短按切模式」与「长按进计时」之间有足够远的间隔，正常切模式不会误入计时。
+static const uint32_t SW2_LONG_PRESS_MS = 2000;
+// 长按确认的外圈闪烁。120 ms 在 60 帧/秒下约 7 帧：肉眼认得出「闪了一下」，又不至于像卡住。
+static const uint32_t RING_FLASH_MS   = 120;
+// 计时模式的默认周期。串口 t N 可临时改，重启回到这里。
 static const uint32_t DRIP_INTERVAL_MS = 60000;
 // 1 g 对应引擎的格/子步²。这是标度旋钮，不是标定常数；串口 g N 按 N/10000 现场改，例如 g 118 = 0.0118。
 // 红豆模式按 1 格 = 4 mm、每帧 4 子步折算，实时重力是 0.0426；0.0118 对应约 1.9 倍慢放，再高就压不住堆叠——竖直柱的冲量每子步最多传一格，
@@ -227,28 +232,43 @@ static int8_t  encPrev  = 0;
 static int8_t  encAccum = 0;
 static int32_t encDetent = 0;
 
-// 三路微动的消抖状态。低电平有效，两个沿都报到串口；动作在松开沿执行——
-// 按住 A 再点一下 B 的时序里，按下时抢先动作会把组合键要用的状态弄脏。
+// 三路微动的消抖状态。低电平有效，两个沿都报到串口。按键动作有三种时序：
+//   SW3   —— 按下沿冻结、松开沿恢复，两个沿都动作；
+//   SW2   —— 短按在松开沿切预设，长按在按住过程中满 2 s 触发；
+//   ENCSW —— 松开沿清空。
+// pressMs 存消抖确认的按下时刻，长按从这里起算；longFired 保证一次按住只触发一次长按，
+// 并在松开时告诉 SW2 分支「这次别切预设」。
 struct ButtonState {
   uint8_t     pin;
   const char *tag;
   bool        stable;      // 已确认的稳定状态，true = 按下
   bool        lastRaw;     // 上次读到的原始状态
   uint32_t    lastEdgeMs;  // 原始状态上次变化的时间
+  uint32_t    pressMs;     // 消抖确认的按下时刻
+  bool        longFired;   // 本次按住已经触发过长按
 };
 
 static ButtonState buttons[] = {
-  { PIN_SW2,   "[SW2]",   false, false, 0 },
-  { PIN_SW3,   "[SW3]",   false, false, 0 },
-  { PIN_ENCSW, "[ENCSW]", false, false, 0 },
+  { PIN_SW2,   "[SW2]",   false, false, 0, 0, false },
+  { PIN_SW3,   "[SW3]",   false, false, 0, 0, false },
+  { PIN_ENCSW, "[ENCSW]", false, false, 0, 0, false },
 };
 static const uint8_t BUTTON_COUNT = sizeof(buttons) / sizeof(buttons[0]);
 
-// SW3 慢速生成任务。松开时清空全部粒子并立刻补一颗，之后每 dripIntervalMs 加一颗；SW3 再次松开、编码器按下或转过一格都会终止它，SW2 只切模式不打断（后续粒子按新模式加）。串口命令不打断，方便台面调参时让它继续跑。
+// 计时模式（原 SW3 慢速生成）。SW2 长按确认闪烁结束后清空全部粒子、立刻补一颗，之后每 dripIntervalMs 加一颗；编码器转动或编码器按键松开都会终止它，SW2 短按只切模式不打断（后续粒子按新模式加）。串口命令不打断，方便台面调参时让它继续跑。
 static uint32_t dripIntervalMs = DRIP_INTERVAL_MS;
 static bool     dripActive  = false;
 static uint32_t dripNextMs  = 0;
 static uint16_t dripAdded   = 0;
+
+// SW2 长按确认闪烁。ringFlashActive 期间 renderWorld() 在世界之上叠外圈；
+// ringFlashThenDrip 表示闪完要进入计时模式，被编码器或 ENCSW 取消后为 false，闪烁本身仍继续。
+static bool     ringFlashActive   = false;
+static uint32_t ringFlashEndMs    = 0;
+static bool     ringFlashThenDrip = false;
+
+// SW3 按住冻结。只停物理推进，不停 IMU、编码器与计时。
+static bool     physicsFrozen = false;
 
 // ============================ 小工具 ============================
 
@@ -618,7 +638,29 @@ static void setIntensity(uint8_t v) {
   mx.control(MD_MAX72XX::INTENSITY, mxIntensity);
 }
 
+// 逻辑坐标下 8x8 的最外圈共 28 颗。MX_ROTATION == 0 时直接写行：
+// 逻辑 y=0 / y=7 整行 0xFF，y=1..6 只亮 x=0 与 x=7（0x81）。外圈上下左右都对称，
+// 即使将来行序理解反了也不会露馅。旋转非 0 时退回 lightPoint，走唯一的坐标换算 logicalToHw()。
+static void drawRingOverlay() {
+  if (MX_ROTATION == 0) {
+    mx.setRow(0, 0xFF);
+    for (uint8_t y = 1; y < 7; y++) mx.setRow(y, 0x81);
+    mx.setRow(7, 0xFF);
+  } else {
+    for (uint8_t x = 0; x < 8; x++) {
+      lightPoint(x, 0);
+      lightPoint(x, 7);
+    }
+    for (uint8_t y = 1; y < 7; y++) {
+      lightPoint(0, y);
+      lightPoint(7, y);
+    }
+  }
+}
+
 // 引擎格号 → 屏幕。引擎 cy = 0 在顶部，固件逻辑 y = 0 在底部，所以唯一的翻转是 y = 7 - cy；x 直接相等。mask 没变就不重画。
+// 所有世界显示都必须经过这里：长按确认的外圈叠加也只在函数末尾画，
+// 否则别处直接 setRow / clear 会把闪烁擦掉，或者让 lastMask 缓存留下残影。
 static void renderWorld(bool force) {
   const uint64_t m = world.mask();
   if (!force && haveMask && m == lastMask) return;
@@ -643,6 +685,8 @@ static void renderWorld(bool force) {
       lightPoint((uint8_t)b.cx, (uint8_t)(7 - b.cy));
     }
   }
+
+  if (ringFlashActive) drawRingOverlay();
 }
 
 // 模式切换只改参数，不重建内核，种子与转动原点保持不变，也不清空现有粒子——同一个初态可以直接看三种物理的差别。
@@ -691,8 +735,26 @@ static void applyMode(uint8_t mode) {
 
 // ============================ 物理节拍 ============================
 
+// 冻结/恢复的唯一切换点。恢复时把节拍重新锚到「现在 + 一个子步」：
+// 冻结期间 tickPhysics 每圈把 nextSubUs 拉到 now，若中间夹了串口阻塞命令，
+// 这一句兜底，保证恢复后最多按正常节拍走一步，不会一次补一大段。
+static void setPhysicsFrozen(bool on) {
+  if (physicsFrozen == on) return;
+  physicsFrozen = on;
+  if (!on) nextSubUs = micros() + SUBSTEP_US;
+  eventLine("[PHY]", on ? "freeze" : "resume");
+}
+
 static void tickPhysics() {
   const uint32_t now = micros();
+
+  if (physicsFrozen) {
+    // 冻结只停物理推进，不停时间：节拍指针跟住 now，恢复时由 setPhysicsFrozen(false)
+    // 重新锚到一个子步之后，所以不会补上冻结期间欠下的子步，也不算 droppedSubsteps。
+    nextSubUs = now;
+    return;
+  }
+
   uint8_t done = 0;
   bool frameDone = false;
 
@@ -716,7 +778,7 @@ static void tickPhysics() {
   if (frameDone) renderWorld(false);
 }
 
-// ============================ SW3 慢速生成 ============================
+// ============================ 计时模式（SW2 长按） ============================
 
 static void stopDrip(const char *why) {
   if (!dripActive) return;
@@ -741,7 +803,43 @@ static bool dripAddOne() {
   return true;
 }
 
-// 松开 SW3：清空、立刻补一颗、重置计时。任务进行中再次松开等于重开，所以先停旧的任务。
+// 取消「闪完进入计时」，但不取消闪烁本身：闪烁是长按已被识别的确认，中途掐掉会像故障；
+// 计时则根本还没开始。编码器转动与 ENCSW 松开走这里。
+static void cancelDripStart(const char *why) {
+  if (!ringFlashThenDrip) return;
+  ringFlashThenDrip = false;
+  char buf[32];
+  snprintf(buf, sizeof(buf), "cancel %s", why);
+  eventLine("[DRIP]", buf);
+}
+
+// SW2 长按触发：先停旧计时（避免闪烁的 120 ms 里旧任务又加一颗），再亮外圈。
+// 真正的清空与补一颗推迟到 tickFlash()，让确认闪烁先被看见。
+static void beginTimerFlash(uint32_t nowMs) {
+  stopDrip("restart");
+  ringFlashActive   = true;
+  ringFlashEndMs    = nowMs + RING_FLASH_MS;
+  ringFlashThenDrip = true;
+  eventLine("[DRIP]", "ring flash");
+  renderWorld(true);   // 强制重画，叠上外圈
+}
+
+// 非阻塞闪烁到期。只有这里负责熄外圈并进入计时，必须在 loop() 里每圈调用。
+static void tickFlash(uint32_t nowMs) {
+  if (!ringFlashActive) return;
+  if ((int32_t)(nowMs - ringFlashEndMs) < 0) return;
+
+  ringFlashActive = false;
+  if (ringFlashThenDrip) {
+    ringFlashThenDrip = false;
+    startDrip(nowMs);   // 内部清空、立刻补一颗并 renderWorld(true)，顺带擦掉外圈
+  } else {
+    // 已被编码器或 ENCSW 取消：只负责熄外圈，恢复世界本身的显示。
+    renderWorld(true);
+  }
+}
+
+// 清空、立刻补一颗、重置计时。计时已经开着时再次进入等于重开，所以先停旧的任务。
 static void startDrip(uint32_t nowMs) {
   if (dripActive) stopDrip("restart");
   world.clear();
@@ -766,6 +864,22 @@ static void tickDrip(uint32_t nowMs) {
 
 // ============================ 微动 ============================
 
+// SW2 长按在按住过程中判定：不依赖松开，也不重复触发。要求 lastRaw 仍为按下，
+// 压掉「物理上已松手、松开消抖还没确认」的 15 ms 窗口里越过阈值而误触发。
+static void pollSw2LongPress(uint32_t nowMs) {
+  for (uint8_t i = 0; i < BUTTON_COUNT; i++) {
+    ButtonState &b = buttons[i];
+    if (b.pin != PIN_SW2) continue;
+    if (!b.stable || !b.lastRaw || b.longFired) return;
+    if ((uint32_t)(nowMs - b.pressMs) < SW2_LONG_PRESS_MS) return;
+
+    b.longFired = true;
+    eventLine(b.tag, "long");
+    beginTimerFlash(nowMs);
+    return;
+  }
+}
+
 static void scanButtons(uint32_t nowMs) {
   for (uint8_t i = 0; i < BUTTON_COUNT; i++) {
     ButtonState &b = buttons[i];
@@ -780,28 +894,43 @@ static void scanButtons(uint32_t nowMs) {
 
     b.stable = raw;
     eventLine(b.tag, raw ? "press" : "release");
-    if (raw) continue;                              // 按下沿只报事件，动作留到松开
 
+    if (raw) {
+      b.pressMs = nowMs;                            // 长按从这里起算
+      b.longFired = false;
+      if (b.pin == PIN_SW3) setPhysicsFrozen(true); // SW3 按下沿冻结，不等松开
+      continue;
+    }
+
+    // 松开沿
     if (b.pin == PIN_SW3) {
-      startDrip(nowMs);
+      setPhysicsFrozen(false);
+      b.longFired = false;
     } else if (b.pin == PIN_SW2) {
-      // SW2 只切模式，不打断 SW3 任务：applyMode 保留现有粒子，慢速生成继续按新模式加。
+      // 长按已经在按住时动作，这次松开不能再切模式。
       // 循环是 水 ↔ 钢珠；红豆预设没有按键入口，见 nextButtonMode()。
-      applyMode(nextButtonMode(simMode));           // 切换保留现有粒子，只恢复该模式的默认参数
-      eventLine("[MODE]", simModeName());
+      if (!b.longFired) {
+        applyMode(nextButtonMode(simMode));         // 切换保留现有粒子，只恢复该模式的默认参数
+        eventLine("[MODE]", simModeName());
+      }
+      b.longFired = false;
     } else {
-      stopDrip("key");                              // ENCSW 先打断 SW3 任务，再清空
+      stopDrip("key");                              // ENCSW 先打断计时，再清空
+      cancelDripStart("key");
       world.clear();
       renderWorld(true);
       eventLine("[ENCSW]", "clear");
     }
   }
+
+  pollSw2LongPress(nowMs);
 }
 
 // ============================ 编码器 ============================
 
 static void handleDetent(int8_t rawDir) {
-  stopDrip("encoder");   // 手动转了编码器，就不再让定时任务继续加粒子
+  stopDrip("encoder");        // 手动转了编码器，就不再让计时任务继续加粒子
+  cancelDripStart("encoder"); // 闪烁期间转一下：计时不启动，闪烁照常闪完
   const int8_t dir = (int8_t)(rawDir * ENCODER_SIGN);
   char buf[40];
 
@@ -894,7 +1023,7 @@ static void printHelp() {
   Serial.println(F("  e [0-100]       设恢复系数（百分数，例如 e 78 = 0.78；钢珠默认 78）；不带参数报当前值"));
   Serial.println(F("  g [1-999]       设重力标度（万分之一，例如 g 118 = 0.0118）；水模式默认 120，红豆与钢珠默认 118，m 切换恢复默认"));
   Serial.println(F("  w [0-400]       设转速增益（百分数，例如 w 150；0 等于停转）；水模式默认 200，红豆与钢珠默认 100，m 切换恢复默认"));
-  Serial.println(F("  t [1-3600]      设 SW3 慢速生成周期（秒，默认 60，重启恢复）；不带参数报当前值"));
+  Serial.println(F("  t [1-3600]      设计时模式加粒子周期（秒，默认 60，重启恢复）；不带参数报当前值"));
   Serial.println(F("  m [water|particles|steel]  切换模式（保留现有粒子）；不带参数报当前模式。particles 是红豆预设，只有这里能切，按键循环不经过它"));
   Serial.println(F("  a [0-99]        设内聚力（万分之一，a 10 = 0.0010；水模式默认 4）；不带参数报当前值"));
   Serial.println(F("  j [0-100]       设键轴黏性（百分数；水模式默认 4）；不带参数报当前值"));
@@ -908,7 +1037,9 @@ static void printHelp() {
                 simModeName(), (unsigned)world.count(), (unsigned)mxIntensity, (unsigned long)world.seed());
   Serial.println(F("水 = 零摩擦 + 零恢复 + 静水压强 + 小内聚力；红豆 = 库仑摩擦堆叠；钢珠 = 低摩擦 + 高恢复的硬颗粒。f / q / u / e 改当前模式的系数，m 切换恢复该模式默认。"));
   Serial.println(F("顺时针转编码器 = 添加，逆时针 = 删除，编码器按键松开 = 清空全部粒子。方向反了就改 Gewu.ino 顶部的 ENCODER_SIGN。"));
-  Serial.println(F("SW3 松开 = 清空全部粒子并立刻补一颗，之后按周期加一颗；SW3 再次松开、编码器按键松开或转动会打断。SW2 松开 = 水 ↔ 钢珠 循环（保留现有粒子），不打断任务；红豆预设不参与按键循环。"));
+  Serial.println(F("SW3 按住 = 冻结全部粒子，松开 = 恢复；冻结不打断计时，编码器增删照常，新加的粒子停在原地。"));
+  Serial.println(F("SW2 短按松开 = 水 ↔ 钢珠 循环（保留现有粒子）；按住 2 秒 = 外圈闪 120 ms 后进入计时模式（清空、立刻补一颗，之后每 t 秒加一颗），长按后的松开不再切模式。"));
+  Serial.println(F("计时模式被编码器转动或编码器按键松开打断；SW2 短按不打断；红豆预设只走 m particles。"));
 }
 
 static void printStatus() {
@@ -947,9 +1078,12 @@ static void printStatus() {
                 (unsigned long)world.seed(), (long)encDetent, (unsigned long)droppedSubsteps,
                 (unsigned long)loopMaxUs, p.substepHz / (double)p.substeps,
                 (unsigned)p.substeps);
-  Serial.printf("[STA] drip=%s next=%lds added=%u interval=%lus\n",
+  Serial.printf("[STA] drip=%s next=%lds added=%u interval=%lus frozen=%s flash=%s timer=%s\n",
                 dripActive ? "on" : "off", (long)dripNextSec,
-                (unsigned)dripAdded, (unsigned long)(dripIntervalMs / 1000));
+                (unsigned)dripAdded, (unsigned long)(dripIntervalMs / 1000),
+                physicsFrozen ? "on" : "off",
+                ringFlashActive ? "on" : "off",
+                ringFlashThenDrip ? "armed" : "off");
 }
 
 static void traceHeader(const char *kind, uint32_t frames) {
@@ -1390,7 +1524,7 @@ void setup() {
   Serial.println(F(" 物理 240 子步每秒 / 每 4 子步一帧 = 60 帧每秒"));
   Serial.println(F(" 模式：水（零摩擦 + 零恢复 + 静水压强，重力 0.0120，转速增益 200%）。m particles 切红豆，m steel 切钢珠"));
   Serial.println(F(" 顺时针转编码器 = 添加一格，逆时针 = 删除最新，编码器按键松开 = 清空全部"));
-  Serial.println(F(" SW2 松开 = 水 ↔ 钢珠 循环（保留粒子），SW3 松开 = 清空后每 60 秒加一格"));
+  Serial.println(F(" SW2 短按 = 水 ↔ 钢珠（保留粒子），按住 2 秒 = 外圈闪后进入计时；SW3 按住冻结、松开恢复"));
   Serial.println(F(" 命令：? 看清单（m 模式 / a 内聚 / j 黏性 / h 压强 / e 恢复 / q 板面摩擦 / n 加 / d 删 / p x y 定点添加 / c 清空 / g 重力 / w 转速增益 / s 状态 / v trace）"));
   Serial.println(F("========================================"));
 
@@ -1452,7 +1586,8 @@ void setup() {
   Serial.println(F("开始：转编码器添加或删除格子；倾斜时零摩擦让水流向低处，竖着拿时水柱会塌、液面会平。"));
   Serial.println(F("内聚 0.0004、黏性 0.04 只负责低速时把水粘成一片，a / j 可现场改；h 调静水压强（默认 1.00）。"));
   Serial.println(F("m particles 切红豆（μ_p 0.05、μ 0.45、e 0.50），m steel 切钢珠（μ_p 0.003、μ 0.15、e 0.78）；q / u / e 可现场改当前模式的系数。"));
-  Serial.println(F("按 SW2 在 水 ↔ 钢珠 循环（保留现有粒子），红豆预设只留 m particles 入口；按 SW3 进入慢速生成：清空后立刻补一格，之后每 60 秒加一格。"));
+  Serial.println(F("按 SW2 短按切 水 ↔ 钢珠（保留现有粒子），红豆预设只留 m particles 入口；按住 2 秒进入计时：外圈闪 120 ms、清空后立刻补一格，之后每 60 秒加一格。"));
+  Serial.println(F("按住 SW3 冻结全部粒子，松开恢复；冻结不打断计时，编码器增删照常。"));
   Serial.println();
 }
 
@@ -1463,11 +1598,12 @@ void loop() {
   const uint32_t nowMs = millis();
 
   pollSerial();          // 永不阻塞；命令响应越快越顺手
-  scanButtons(nowMs);    // 微动：SW3 启动慢速生成，SW2 切换模式（不打断），ENCSW 打断并清空
-  scanEncoder();         // 每轮都扫，不按模式门控
-  tickDrip(nowMs);       // SW3 任务的定时加粒子
+  scanButtons(nowMs);    // 微动：SW3 按下冻结/松开恢复，SW2 短按切模式、长按判定，ENCSW 打断并清空
+  scanEncoder();         // 每轮都扫，不按模式门控；转动会取消待启动的计时
+  tickFlash(nowMs);      // 长按外圈闪到点后熄外圈并进入计时
+  tickDrip(nowMs);       // 计时模式的定时加粒子
   tickImu(nowMs);        // 200 Hz 更新重力
-  tickPhysics();         // 240 Hz 子步，每 4 个子步渲染一帧
+  tickPhysics();         // 240 Hz 子步，每 4 个子步渲染一帧；冻结时直接返回
 
   const uint32_t dt = micros() - loopStart;
   if (dt > loopMaxUs) loopMaxUs = dt;

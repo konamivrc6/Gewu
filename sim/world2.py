@@ -195,6 +195,7 @@ class World2:
         self.stats = {"commits": 0, "blocked": 0, "wall": 0}
         self._seed = seed
         self._tilt = 0.0
+        self._gvec = None               # 逐位 trace 钉死的重力向量；None = 由 _tilt 算
         self._axis_flip = False
         self.omega = (0, 0, 0)          # 弧度 / 子步，体坐标
         self.omega_dot = (0, 0, 0)      # 弧度 / 子步²，体坐标
@@ -218,6 +219,15 @@ class World2:
 
     def set_tilt(self, deg: float) -> None:
         self._tilt = deg
+        self._gvec = None
+
+    def set_gravity_q16(self, gx: int, gy: int) -> None:
+        """直接钉住重力向量（Q16.16，引擎坐标），绕开 set_tilt 的浮点三角函数。
+
+        逐位 trace 用：固件的 `setGravityVectorQ16()` 收的就是整数向量，Python 这边若用
+        `set_tilt(θ)` 现算 sin/cos，两个 libm 的最后一位不保证一致，fromFloat 一取整就可能差 1 LSB。
+        """
+        self._gvec = (gx, gy)
 
     @property
     def frame_hz(self) -> float:
@@ -253,6 +263,8 @@ class World2:
         self.omega_dot = (from_float(wd * ux), from_float(wd * uy), from_float(wd * uz))
 
     def gvec(self):
+        if self._gvec is not None:
+            return self._gvec
         r = math.radians(self._tilt)
         return (mul(self.g, from_float(math.sin(r))),
                 mul(self.g, from_float(math.cos(r))))

@@ -896,7 +896,7 @@ static void printHelp() {
   Serial.println(F("  y [0-999]       设屈服门 μ（千分之一，例如 y 150 = 0.15；0 = 关闭，水模式必须为 0）；不带参数报当前值"));
   Serial.println(F("  s               打印状态、统计与不变量"));
   Serial.println(F("  k N             同步推进 N 帧（台面测试用，会阻塞输入）"));
-  Serial.println(F("  v plain|friction|spin|water [帧数]   确定性 trace；前三种对照 sim/particle/port_trace.py，water 对照 sim/water/port_trace.py"));
+  Serial.println(F("  v plain|friction|spin|water|hydro|hydrod|grain|graind [帧数]   确定性 trace；plain / friction / spin 对照 sim/particle/port_trace.py，water 对照 sim/water/port_trace.py，hydro / hydrod / grain / graind 对照 sim/water/port_trace_hydro.py"));
   Serial.println(F("  ?               本清单"));
   Serial.printf("当前：mode=%s  n=%u  intensity=%u  seed=%lu\n",
                 simModeName(), (unsigned)world.count(), (unsigned)mxIntensity, (unsigned long)world.seed());
@@ -960,8 +960,13 @@ static void runTrace(const char *kind, uint32_t frames) {
   const bool isFriction = eqNoCase(kind, "friction");
   const bool isPlain = eqNoCase(kind, "plain");
   const bool isWater = eqNoCase(kind, "water");
-  if (!isSpin && !isFriction && !isPlain && !isWater) {
-    ackErr("err v plain|friction|spin|water");
+  const bool isHydro = eqNoCase(kind, "hydro");
+  const bool isHydroD = eqNoCase(kind, "hydrod");
+  const bool isGrain = eqNoCase(kind, "grain");
+  const bool isGrainD = eqNoCase(kind, "graind");
+  const bool isPress = isHydro || isHydroD || isGrain || isGrainD;
+  if (!isSpin && !isFriction && !isPlain && !isWater && !isPress) {
+    ackErr("err v plain|friction|spin|water|hydro|hydrod|grain|graind");
     return;
   }
   if (frames == 0 || frames > TRACE_MAX_FRAME) {
@@ -985,18 +990,41 @@ static void runTrace(const char *kind, uint32_t frames) {
     tp.cohesionDiag = WATER_TRACE_COHESION_DIAG;
     tp.cohesionDamping = WATER_TRACE_COHESION_DAMP;
   }
+  if (isPress) {
+    // 只留静水压强：零摩擦、零恢复、零内聚，任何一条别的项都会把压强路径的差异盖住。
+    tp.gravity = 0.0;
+    tp.gravityTotal = 0.0;
+    tp.plateFriction = 0.0;
+    tp.friction = 0.0;
+    tp.restitution = 0.0;
+    tp.hydrostatic = 1.0;
+    // 豆子预设的屈服 μ。斜向场景里 0.15 几乎不触发门（只挡 116 次），0.45 能挡 3232 次，
+    // 阈值比较的两侧才都走得到；竖直场景 0.45 也挡 2927 次、放行自由竖列 129 次。
+    if (isGrain || isGrainD) tp.yieldMu = 0.45;
+  }
   if (!traceWorld.init(tp)) {
     ackErr("err trace init");
     return;
   }
 
-  // 居中 4×4，行优先，与 sim/particle/port_trace.py 的 center_cells() 顺序一致。
-  for (int y = 2; y < 6; y++) {
-    for (int x = 2; x < 6; x++) traceWorld.addAt(x, y);
+  if (isPress) {
+    // 贴墙 4×3 + 中下 2 格 + 右侧 4 格竖列 + 右上 1 格，共 19 块；顺序与 port_trace_hydro.py 的 cells() 逐项一致。
+    for (int y = 5; y < 8; y++) {
+      for (int x = 0; x < 4; x++) traceWorld.addAt(x, y);
+    }
+    traceWorld.addAt(5, 6);
+    traceWorld.addAt(5, 7);
+    for (int y = 4; y < 8; y++) traceWorld.addAt(6, y);
+    traceWorld.addAt(7, 4);
+  } else {
+    // 居中 4×4，行优先，与 sim/particle/port_trace.py 的 center_cells() 顺序一致。
+    for (int y = 2; y < 6; y++) {
+      for (int x = 2; x < 6; x++) traceWorld.addAt(x, y);
+    }
   }
 
   traceWorld.setFrictionAuto(true);
-  traceWorld.setGravityTotalQ16(isWater ? 0 : 79);
+  traceWorld.setGravityTotalQ16((isWater || isPress) ? 0 : 79);
 
   if (isSpin) {
     traceWorld.setGravityVectorQ16(0, 0);
@@ -1005,6 +1033,10 @@ static void runTrace(const char *kind, uint32_t frames) {
     traceWorld.setGravityVectorQ16(0, 33);        // G = 79，g∥ = 33，N ≈ 72，fdv > 0
   } else if (isWater) {
     traceWorld.setGravityVectorQ16(0, 0);         // 零重力，只压内聚与键轴阻尼
+  } else if (isHydro || isGrain) {
+    traceWorld.setGravityVectorQ16(0, 79);        // 竖直重力：对称简并、贴墙、自由面
+  } else if (isHydroD || isGrainD) {
+    traceWorld.setGravityVectorQ16(40, 66);       // 约 31° 斜向：射线跨格插值与对角侧向偏移
   } else {
     traceWorld.setGravityVectorQ16(0, 79);        // 默认 fdv = 0 的场景
   }
@@ -1284,7 +1316,7 @@ static void runCommand(char *line) {
     }
 
     case 'v': {
-      if (nw != 2 && nw != 3) { ackErr("err v plain|friction|spin [frames]"); return; }
+      if (nw != 2 && nw != 3) { ackErr("err v kind|frames"); return; }
       uint32_t frames = eqNoCase(w[1], "spin") ? 600 : 240;
       if (nw == 3 && (!parseU32(w[2], TRACE_MAX_FRAME, &frames) || frames == 0)) {
         ackErr("err v frames");

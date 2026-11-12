@@ -705,8 +705,11 @@ inline void PhysicsWorld::pressureAccel(uint8_t i, int32_t &fx, int32_t &fy) con
     } else {
       int32_t bestP = 0, bestM = 0;
       bool haveP = false, haveM = false;
+      // 顺序必须是 LATERAL_OFFSETS，不是 COHESION_OFFSETS：平放竖直重力时 dot 只由 dx 决定，
+      // (±1,0) 与 (±1,±1) 全部同分，并列时取哪一个由扫描顺序决定。Python 的 `_lateral_pair()`
+      // 用的是这一条；换成 COHESION_OFFSETS 会在第一帧就分叉，`v hydro` 抓到了。
       for (uint8_t k = 0; k < 8; k++) {
-        const CohesionOffset &o = COHESION_OFFSETS[k];
+        const LateralOffset &o = LATERAL_OFFSETS[k];
         const int32_t dot = fx::add(fx::mul(fx::fromFloat((double)o.dx), sx),
                                     fx::mul(fx::fromFloat((double)o.dy), sy));
         if (!haveP || dot > bestP) {

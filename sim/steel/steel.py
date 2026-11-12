@@ -10,11 +10,11 @@
 全局选项（--frames / --n / --seed 等）写在子命令之前，与 sim/water/water.py 一致。
 
 
-钢珠在本内核里仍是「一格一个方形块」，和水、豆子共用 `sim/world2.py` 的格子锚定内核。没有球体、没有多格刚体，也没有旋转自由度。所以这组参数不是几何模型，而是一组材料预设：板面摩擦取滚动阻力系数的量级，块间摩擦取干态钢-钢滑动的低端，恢复系数取钢-钢与钢-硬质墙的折中。方块不会滚，低 μ_p 就是在等效那个缺失的滚动自由度。
+钢珠在本内核里仍是「一格一个方形块」，和水、红豆共用 `sim/world2.py` 的格子锚定内核。没有球体、没有多格刚体，也没有旋转自由度。所以这组参数不是几何模型，而是一组材料预设：板面摩擦取滚动阻力系数的量级，块间摩擦取干态钢-钢滑动的低端，恢复系数取钢-钢与钢-硬质墙的折中。方块不会滚，低 μ_p 就是在等效那个缺失的滚动自由度。
 
 引擎坐标沿用 world2：x 向右、y 向下、原点左上。重力方向用 `set_tilt()` 旋转，`tilt=0` 时重力指向 +y（屏幕下方）。
 
-尺度：1 格 = 4 mm，240 Hz 子步，4 子步一帧。G = 0.0118 格/子步² 对应约 1.90 倍慢放。密度不进入自由落体，所以钢珠和豆子共用同一个重力标度；「更重」只能靠低摩擦与高恢复表现。
+尺度：1 格 = 4 mm，240 Hz 子步，4 子步一帧。G = 0.0118 格/子步² 对应约 1.90 倍慢放。密度不进入自由落体，所以钢珠和红豆共用同一个重力标度；「更重」只能靠低摩擦与高恢复表现。
 """
 
 from __future__ import annotations
@@ -32,14 +32,14 @@ from fixed import ONE, from_float, to_float
 from world2 import Params, World2
 
 # 与固件 Gewu.ino 的 STEEL_* 常量一一对应。改这里时两边一起改。
-GRAVITY_DEFAULT = 0.0118      # 与粒子和钢珠模式一致；水的 0.0120 是另一支
+GRAVITY_DEFAULT = 0.0118      # 与红豆和钢珠模式一致；水的 0.0120 是另一支
 PLATE_FRICTION_DEFAULT = 0.003
 PAIR_FRICTION_DEFAULT = 0.15
 RESTITUTION_DEFAULT = 0.78
 DAMPING_DEFAULT = 0.9999
-SPIN_SCALE_NOTE = "固件里钢珠的转速增益是 100%，与粒子模式一致"
+SPIN_SCALE_NOTE = "固件里钢珠的转速增益是 100%，与红豆模式一致"
 
-# 豆子预设只用于对照，数值抄自固件的 PARTICLE_* / PLATE_FRICTION_INIT / PAIR_FRICTION_INIT。
+# 红豆预设只用于对照，数值抄自固件的 PARTICLE_* / PLATE_FRICTION_INIT / PAIR_FRICTION_INIT。
 BEAN = dict(plate_friction=0.05, friction=0.45, restitution=0.50, damping=0.9998)
 
 
@@ -186,7 +186,7 @@ def free_fall_height(world: World2, frames: int) -> tuple[list[int], int]:
 
 
 def experiment_drop(args) -> None:
-    """单颗落体：回弹高度必须符合 e²，钢珠应该比豆子弹得久。"""
+    """单颗落体：回弹高度必须符合 e²，钢珠应该比红豆弹得久。"""
     print(f"单颗落体：G={GRAVITY_DEFAULT}，{args.frames} 帧")
     for name in ("steel", "bean"):
         p = preset_params(name, 1)
@@ -266,7 +266,7 @@ def experiment_bounce(args) -> None:
 def experiment_tilt(args) -> None:
     """斜板流动：板面与水平成 φ 角，g∥ = G sinφ，N = G cosφ；再绕屏幕法线转 gravity 角。
 
-    钢珠的 μ_p 只有 0.003，N 再小也几乎不抵抗流动；豆子的 0.05 会在低 φ 时把料钉住。看质心与 bbox 的差别。
+    钢珠的 μ_p 只有 0.003，N 再小也几乎不抵抗流动；红豆的 0.05 会在低 φ 时把料钉住。看质心与 bbox 的差别。
     """
     phi = math.radians(args.board)
     g_par = GRAVITY_DEFAULT * math.sin(phi)
@@ -311,7 +311,7 @@ def main(argv=None) -> int:
     ap.add_argument("--preset", choices=["steel", "bean"], default="steel",
                     help="只影响 show；drop / pile / plate / bounce / tilt 都会跑两边对照")
     ap.add_argument("--board", type=float, default=2.0,
-                    help="tilt 用。板面与水平的夹角，度；g∥ = G sinφ，N = G cosφ。默认 2°：钢珠会流，豆子不动")
+                    help="tilt 用。板面与水平的夹角，度；g∥ = G sinφ，N = G cosφ。默认 2°：钢珠会流，红豆不动")
     ap.add_argument("--angle", type=float, default=30.0,
                     help="屏幕内重力方向，度；0 = 朝屏幕下方。默认 30° 让重力有横向分量，才看得出流动")
     ap.add_argument("--every", type=int, default=30)
@@ -320,7 +320,7 @@ def main(argv=None) -> int:
     sub.add_parser("pile", help="从顶部落堆")
     sub.add_parser("plate", help="板面启滑阈值")
     sub.add_parser("bounce", help="扫恢复系数")
-    sub.add_parser("tilt", help="斜板流动，钢珠对豆子")
+    sub.add_parser("tilt", help="斜板流动，钢珠对红豆")
     sub.add_parser("show", help="终端播放")
 
     args = ap.parse_args(argv)

@@ -24,7 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import checker
 from world2 import Params, World2
 
-GRAVITY_DEFAULT = 0.0120      # 与固件水模式的 GRAVITY_PER_G_WATER 一致（粒子模式的 3 倍），格/子步²
+GRAVITY_DEFAULT = 0.0120      # 与固件水模式的 GRAVITY_PER_G_WATER 一致（红豆模式的 3 倍），格/子步²
 COHESION_DEFAULT = 0.0010     # 约为水模式重力的十二分之一
 DIAG_DEFAULT = 0.5            # 对角键相对轴向的权重
 HYDROSTATIC_DEFAULT = 1.0     # 静水压强增益：横向加速度 = gain · g∥ · 两侧水头差

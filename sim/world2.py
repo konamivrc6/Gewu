@@ -426,10 +426,11 @@ class World2:
         self.press_kg = mul(self.press, gmag)
         self.press_active = self.press_kg != 0
         if self.press_active:
-            if self.mu_yield != 0:
-                # 侧向与重力垂直；「最接近 +s / −s」的一对格偏移对全场相同，每子步算一次。
-                sx, sy = neg(self.press_uy), self.press_ux
-                self.press_lat_p, self.press_lat_m = self._lateral_pair(sx, sy)
+            # 侧向与重力垂直；「最接近 +s / −s」的一对格偏移对全场相同，每子步算一次。
+            # 水路径原来每块进对称简并分支时都要重搜一遍这张表（32 块就是 32 次同样的 8 偏移搜索），
+            # 提到这里后逐块只剩查表；结果与逐块搜索逐位相同。
+            sx, sy = neg(self.press_uy), self.press_ux
+            self.press_lat_p, self.press_lat_m = self._lateral_pair(sx, sy)
             self._build_depth()
 
     def _build_depth(self) -> None:
@@ -443,8 +444,9 @@ class World2:
         half = ONE >> 1
         rx, ry = self.press_ray_x, self.press_ray_y
         for b in self.blocks:
-            px = add(from_float(b.cx), half)
-            py = add(from_float(b.cy), half)
+            # 格号是整数，from_float(v) 在整数上就是 v * ONE；这里直接乘，省掉每块 3~5 次空转。
+            px = add(b.cx * ONE, half)
+            py = add(b.cy * ONE, half)
             n = 0
             for _ in range(24):
                 qx = add(px, rx)
@@ -463,25 +465,26 @@ class World2:
             cx, cy = cell(qx), cell(qy)
             best_f = None
             if cx != ox and rx != 0:
-                bx = from_float(ox + 1 if cx > ox else ox)
+                bx = (ox + 1 if cx > ox else ox) * ONE
                 f = div(sub(bx, px), rx)
                 if f >= 0:
                     best_f = f
             if cy != oy and ry != 0:
-                by = from_float(oy + 1 if cy > oy else oy)
+                by = (oy + 1 if cy > oy else oy) * ONE
                 f = div(sub(by, py), ry)
                 if f >= 0 and (best_f is None or f < best_f):
                     best_f = f
             if best_f is None:
                 best_f = 0
-            nq = add(from_float(n), best_f)          # 半格计数，含小数
+            nq = add(n * ONE, best_f)                # 半格计数，含小数
             depth[b.cx + b.cy * self.W] = halve(sub(nq, ONE)) if nq > ONE else 0
 
     def _lateral_pair(self, sx, sy):
         """找与侧向 s 最接近、最背离的一对八邻域偏移。选择顺序与原来逐块搜索完全一致，结果逐位不变。"""
         best_p = best_m = None
         for ox, oy in ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)):
-            dot = add(mul(from_float(ox), sx), mul(from_float(oy), sy))
+            # from_float(±1) 就是 ±ONE，直接乘；mul(±ONE, s) 精确等于 ±s，不会引入取整。
+            dot = add(mul(ox * ONE, sx), mul(oy * ONE, sy))
             if best_p is None or dot > best_p[0]:
                 best_p = (dot, ox, oy)
             if best_m is None or dot < best_m[0]:
@@ -529,27 +532,28 @@ class World2:
 
             free = not blocked(b.cx + pdx, b.cy + pdy) and not blocked(b.cx + mdx, b.cy + mdy)
             # Mohr–Coulomb：有侧向支撑时，侧向坡度不够大就不推。μ = 0 的纯压强（水）不走这条。
-            if not free and hypot(tx, ty) <= mul(self.mu_yield, own):
+            # isqrt(tx²+ty²) ≤ T 与 tx²+ty² < (T+1)² 是整数恒等（T 非负），比较不用开方。
+            thr = mul(self.mu_yield, own)
+            if not free and tx * tx + ty * ty < (thr + 1) * (thr + 1):
                 return 0, 0
         ax = neg(mul(self.press_kg, tx))
         ay = neg(mul(self.press_kg, ty))
         if tx == 0 and ty == 0 and own > 0:
             # 找与真实侧向最接近的一对邻居；两边都空才是自由站立的窄柱。墙侧会给出非零梯度，走不到这里。
+            # 偏移对在 _update_pressure 里已经按重力方向算好，全场同一对，这里只查表。
             sx, sy = neg(self.press_uy), self.press_ux
+            (pdx, pdy), (mdx, mdy) = self.press_lat_p, self.press_lat_m
             if self.mu_yield != 0:
                 # 屈服门已经保证：非自由竖列在 tx = ty = 0 时（坡度 0 ≤ μ·own）已经返回了。
-                (pdx, pdy), (mdx, mdy) = self.press_lat_p, self.press_lat_m
                 can_push = True
             else:
-                (pdx, pdy), (mdx, mdy) = self._lateral_pair(sx, sy)
-
                 def empty(x, y):
                     return 0 <= x < W and 0 <= y < H and self.owner[x + y * W] < 0
 
                 can_push = empty(b.cx + pdx, b.cy + pdy) and empty(b.cx + mdx, b.cy + mdy)
             if can_push:
-                dcx = sub(from_float((W - 1) * 0.5), from_float(b.cx))
-                dcy = sub(from_float((H - 1) * 0.5), from_float(b.cy))
+                dcx = sub(((W - 1) * ONE) // 2, b.cx * ONE)
+                dcy = sub(((H - 1) * ONE) // 2, b.cy * ONE)
                 toward = add(mul(dcx, sx), mul(dcy, sy))
                 f = mul(self.press_kg, own if toward > 0 else neg(own))
                 ax = add(ax, mul(f, sx))

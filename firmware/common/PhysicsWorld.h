@@ -569,35 +569,38 @@ inline void PhysicsWorld::updatePressure(int32_t gx, int32_t gy) {
   pressKg_ = fx::mul(press_, gmag);
   pressActive_ = (pressKg_ != 0);
   if (pressActive_) {
-    if (muYield_ != 0) {
-      // 侧向与重力垂直；这对偏移对全场相同，每子步算一次，不逐块重算。
-      const int32_t sx = fx::neg(pressUy_);
-      const int32_t sy = pressUx_;
-      int32_t bestP = 0, bestM = 0;
-      int8_t pdx = 0, pdy = 0, mdx = 0, mdy = 0;
-      bool haveP = false, haveM = false;
-      for (uint8_t k = 0; k < 8; k++) {
-        const LateralOffset &o = LATERAL_OFFSETS[k];
-        const int32_t dot = fx::add(fx::mul(fx::fromFloat((double)o.dx), sx),
-                                    fx::mul(fx::fromFloat((double)o.dy), sy));
-        if (!haveP || dot > bestP) {
-          bestP = dot;
-          pdx = o.dx;
-          pdy = o.dy;
-          haveP = true;
-        }
-        if (!haveM || dot < bestM) {
-          bestM = dot;
-          mdx = o.dx;
-          mdy = o.dy;
-          haveM = true;
-        }
+    // 侧向与重力垂直；这对偏移对全场相同，每子步算一次，不逐块重算。水路径的对称简并分支
+    // 原来也逐块重搜这张表，现在两条路径都只查表。
+    const int32_t sx = fx::neg(pressUy_);
+    const int32_t sy = pressUx_;
+    // 顺序必须是 LATERAL_OFFSETS，不是 COHESION_OFFSETS：平放竖直重力时 dot 只由 dx 决定，
+    // (±1,0) 与 (±1,±1) 全部同分，并列时取哪一个由扫描顺序决定。Python 的 `_lateral_pair()` 用的是这一条；
+    // 换成 COHESION_OFFSETS 会在第一帧就分叉，`v hydro` 抓到了。
+    int32_t bestP = 0, bestM = 0;
+    int8_t pdx = 0, pdy = 0, mdx = 0, mdy = 0;
+    bool haveP = false, haveM = false;
+    for (uint8_t k = 0; k < 8; k++) {
+      const LateralOffset &o = LATERAL_OFFSETS[k];
+      // ±1 / 0 乘 ONE 是精确的，不用 fromFloat（软浮点，每子步 16 次）。
+      const int32_t dot = fx::add(fx::mul((int32_t)o.dx * fx::ONE, sx),
+                                  fx::mul((int32_t)o.dy * fx::ONE, sy));
+      if (!haveP || dot > bestP) {
+        bestP = dot;
+        pdx = o.dx;
+        pdy = o.dy;
+        haveP = true;
       }
-      latPdx_ = pdx;
-      latPdy_ = pdy;
-      latMdx_ = mdx;
-      latMdy_ = mdy;
+      if (!haveM || dot < bestM) {
+        bestM = dot;
+        mdx = o.dx;
+        mdy = o.dy;
+        haveM = true;
+      }
     }
+    latPdx_ = pdx;
+    latPdy_ = pdy;
+    latMdx_ = mdx;
+    latMdy_ = mdy;
     buildPressureDepth();
   }
 }
@@ -607,8 +610,9 @@ inline void PhysicsWorld::buildPressureDepth() {
   const int32_t half = fx::ONE >> 1;
   for (uint8_t i = 0; i < count_; i++) {
     const Block &b = blocks_[i];
-    int32_t px = fx::add(fx::fromFloat((double)b.cx), half);
-    int32_t py = fx::add(fx::fromFloat((double)b.cy), half);
+    // 格号是整数，fromFloat(v) 在整数上就是 v * ONE；直接乘，省掉每块 3~5 次软浮点。
+    int32_t px = fx::add((int32_t)b.cx * fx::ONE, half);
+    int32_t py = fx::add((int32_t)b.cy * fx::ONE, half);
     uint8_t n = 0;
     for (uint8_t k = 0; k < 24; k++) {
       const int32_t qx = fx::add(px, pressRayX_);
@@ -629,7 +633,7 @@ inline void PhysicsWorld::buildPressureDepth() {
     int32_t bestF = 0;
     bool haveF = false;
     if (cx != ox && pressRayX_ != 0) {
-      const int32_t bx = fx::fromFloat((double)(cx > ox ? ox + 1 : ox));
+      const int32_t bx = (int32_t)(cx > ox ? ox + 1 : ox) * fx::ONE;
       const int32_t f = fx::div(fx::sub(bx, px), pressRayX_);
       if (f >= 0) {
         bestF = f;
@@ -637,14 +641,14 @@ inline void PhysicsWorld::buildPressureDepth() {
       }
     }
     if (cy != oy && pressRayY_ != 0) {
-      const int32_t by = fx::fromFloat((double)(cy > oy ? oy + 1 : oy));
+      const int32_t by = (int32_t)(cy > oy ? oy + 1 : oy) * fx::ONE;
       const int32_t f = fx::div(fx::sub(by, py), pressRayY_);
       if (f >= 0 && (!haveF || f < bestF)) {
         bestF = f;
         haveF = true;
       }
     }
-    const int32_t nq = fx::add(fx::fromFloat((double)n), haveF ? bestF : 0);   // 半格计数，含小数
+    const int32_t nq = fx::add((int32_t)n * fx::ONE, haveF ? bestF : 0);   // 半格计数，含小数
     pressDepth_[b.cx + b.cy * (int16_t)W_] =
         (nq > fx::ONE) ? fx::halve(fx::sub(nq, fx::ONE)) : 0;
   }
@@ -681,7 +685,11 @@ inline void PhysicsWorld::pressureAccel(uint8_t i, int32_t &fx, int32_t &fy) con
         !blocked((int16_t)(b.cx + latPdx_), (int16_t)(b.cy + latPdy_)) &&
         !blocked((int16_t)(b.cx + latMdx_), (int16_t)(b.cy + latMdy_));
     // Mohr–Coulomb：有侧向支撑时，侧向坡度不够大就不推。
-    if (!freeTower && fx::hypot(tx, ty) <= fx::mul(muYield_, own)) {
+    // isqrt(tx²+ty²) ≤ T 与 tx²+ty² < (T+1)² 是整数恒等（T 非负），比较不用开方。
+    // 量程：|tx|,|ty| ≤ 8 格 = 524288，平方和上界 5.5e11，int64 装得下。
+    const int32_t thr = fx::mul(muYield_, own);
+    const int64_t mag2 = (int64_t)tx * tx + (int64_t)ty * ty;
+    if (!freeTower && mag2 < (int64_t)(thr + 1) * (int64_t)(thr + 1)) {
       fx = 0;
       fy = 0;
       return;
@@ -693,49 +701,26 @@ inline void PhysicsWorld::pressureAccel(uint8_t i, int32_t &fx, int32_t &fy) con
   if (tx == 0 && ty == 0 && own > 0) {
     const int32_t sx = fx::neg(pressUy_);
     const int32_t sy = pressUx_;
-    int8_t pdx = 0, pdy = 0, mdx = 0, mdy = 0;
+    // 偏移对在 updatePressure() 里已经按重力方向算好，全场同一对，这里只查表。
+    const int8_t pdx = latPdx_;
+    const int8_t pdy = latPdy_;
+    const int8_t mdx = latMdx_;
+    const int8_t mdy = latMdy_;
     bool canPush = false;
     if (muYield_ != 0) {
       // 屈服门已经保证：非自由竖列在 tx = ty = 0 时（坡度 0 ≤ μ·own）已经返回了。
-      pdx = latPdx_;
-      pdy = latPdy_;
-      mdx = latMdx_;
-      mdy = latMdy_;
       canPush = true;
     } else {
-      int32_t bestP = 0, bestM = 0;
-      bool haveP = false, haveM = false;
-      // 顺序必须是 LATERAL_OFFSETS，不是 COHESION_OFFSETS：平放竖直重力时 dot 只由 dx 决定，
-      // (±1,0) 与 (±1,±1) 全部同分，并列时取哪一个由扫描顺序决定。Python 的 `_lateral_pair()`
-      // 用的是这一条；换成 COHESION_OFFSETS 会在第一帧就分叉，`v hydro` 抓到了。
-      for (uint8_t k = 0; k < 8; k++) {
-        const LateralOffset &o = LATERAL_OFFSETS[k];
-        const int32_t dot = fx::add(fx::mul(fx::fromFloat((double)o.dx), sx),
-                                    fx::mul(fx::fromFloat((double)o.dy), sy));
-        if (!haveP || dot > bestP) {
-          bestP = dot;
-          pdx = o.dx;
-          pdy = o.dy;
-          haveP = true;
-        }
-        if (!haveM || dot < bestM) {
-          bestM = dot;
-          mdx = o.dx;
-          mdy = o.dy;
-          haveM = true;
-        }
-      }
       auto empty = [&](int16_t x, int16_t y) -> bool {
         return x >= 0 && x < (int16_t)W_ && y >= 0 && y < (int16_t)H_ &&
                owner_[x + y * (int16_t)W_] < 0;
       };
-      canPush = haveP && haveM &&
-                empty((int16_t)(b.cx + pdx), (int16_t)(b.cy + pdy)) &&
+      canPush = empty((int16_t)(b.cx + pdx), (int16_t)(b.cy + pdy)) &&
                 empty((int16_t)(b.cx + mdx), (int16_t)(b.cy + mdy));
     }
     if (canPush) {
-      const int32_t dcx = fx::sub(fx::fromFloat((W_ - 1) * 0.5), fx::fromFloat((double)b.cx));
-      const int32_t dcy = fx::sub(fx::fromFloat((H_ - 1) * 0.5), fx::fromFloat((double)b.cy));
+      const int32_t dcx = fx::sub((int32_t)(W_ - 1) * fx::ONE / 2, (int32_t)b.cx * fx::ONE);
+      const int32_t dcy = fx::sub((int32_t)(H_ - 1) * fx::ONE / 2, (int32_t)b.cy * fx::ONE);
       const int32_t toward = fx::add(fx::mul(dcx, sx), fx::mul(dcy, sy));
       const int32_t f = fx::mul(pressKg_, toward > 0 ? own : fx::neg(own));
       fx = fx::add(fx, fx::mul(f, sx));

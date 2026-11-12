@@ -37,6 +37,7 @@ struct Params {
   double cohesionDiag;     // 对角键相对轴向的权重，0..1
   double cohesionDamping;  // 沿键轴的相对速度阻尼，0..1。等效黏性
   double hydrostatic;      // 静水压强增益，0 = 关闭。横向加速度 = 增益 · g∥ · 两侧水头差。补上内聚力缺的「重量变横向推力」那一环
+  double yieldMu;          // 屈服门摩擦系数 μ，0 = 关闭（水模式的纯压强）。>0 时只在侧向坡度超过 μ·own 或自由竖列上施加压强
   double pivotX;           // 转动原点 = 加速度计位置，格坐标
   double pivotY;
   uint8_t substeps;
@@ -49,6 +50,7 @@ struct Params {
         plateFriction(0.35), restitution(0.20), restitutionSlop(0.004),
         friction(0.55), damping(0.9995), vmax(0.6),
         cohesion(0.0), cohesionDiag(0.5), cohesionDamping(0.0), hydrostatic(0.0),
+        yieldMu(0.0),
         pivotX(4.0), pivotY(4.0), substeps(2), substepHz(120.0),
         gateOrder(GATE_PEN), axisOrder(AXIS_VEL) {}
 };
@@ -74,6 +76,16 @@ static const CohesionOffset COHESION_OFFSETS[8] = {
   {-1,  1, -46341,  46341, true},
   { 0,  1,      0,  65536, false},
   { 1,  1,  46341,  46341, true},
+};
+
+// 屈服门的侧向搜索顺序。必须与 sim/world2.py 的 _lateral_pair 完全一致：那条顺序是从原始逐块搜索里抄来的，
+// 与上面的 COHESION_OFFSETS 不同；平局（恰好 45°）时选哪一对由它决定，逐位对照就靠这个。
+struct LateralOffset {
+  int8_t dx, dy;
+};
+static const LateralOffset LATERAL_OFFSETS[8] = {
+  { 1,  0}, {-1,  0}, { 0,  1}, { 0, -1},
+  { 1,  1}, { 1, -1}, {-1,  1}, {-1, -1},
 };
 
 // 成对遍历用的半平面偏移，对应 COHESION_OFFSETS 的下标：(1,0) (0,1) (1,1) (-1,1)。
@@ -169,6 +181,9 @@ class PhysicsWorld {
   // ---------- 静水压强（水模式） ----------
   bool setHydrostaticFloat(double h);
   double hydrostatic() const { return p_.hydrostatic; }
+  // ---------- 屈服门（颗粒模式） ----------
+  bool setYieldMuFloat(double m);
+  double yieldMu() const { return p_.yieldMu; }
   bool setVmaxQ16(int32_t v);
   void setSubsteps(uint8_t n) { if (n > 0) p_.substeps = n; }
   void setGateOrder(GateOrder o) { p_.gateOrder = o; }
@@ -232,6 +247,9 @@ class PhysicsWorld {
   int32_t pressUx_, pressUy_;       // 真实重力单位向量（Q16.16，指向重力一侧）
   int32_t pressRayX_, pressRayY_;   // -0.5 · 单位重力，半格步长
   int32_t pressDepth_[MAX_CELLS];   // 水头表，单位格，Q16.16；空格为 0
+  int32_t muYield_;                 // 屈服门 μ，Q16.16；0 = 关闭（水模式的纯压强）
+  int8_t latPdx_, latPdy_;          // 本子步最接近 +侧向 的格偏移
+  int8_t latMdx_, latMdy_;          // 本子步最接近 −侧向 的格偏移
 
   int32_t pivx_, pivy_;
   int32_t omega_[3];
@@ -288,6 +306,9 @@ inline bool PhysicsWorld::init(const Params &p) {
   pressRayX_ = 0;
   pressRayY_ = -(fx::ONE >> 1);
   memset(pressDepth_, 0, sizeof(pressDepth_));
+  if (p.yieldMu < 0.0) return false;
+  muYield_ = fx::fromFloat(p.yieldMu);
+  latPdx_ = latPdy_ = latMdx_ = latMdy_ = 0;
 
   pivx_ = fx::fromFloat(p.pivotX);
   pivy_ = fx::fromFloat(p.pivotY);
@@ -523,6 +544,13 @@ inline bool PhysicsWorld::setHydrostaticFloat(double h) {
   return true;
 }
 
+inline bool PhysicsWorld::setYieldMuFloat(double m) {
+  if (m < 0.0) return false;
+  p_.yieldMu = m;
+  muYield_ = fx::fromFloat(m);
+  return true;
+}
+
 inline void PhysicsWorld::updatePressure(int32_t gx, int32_t gy) {
   if (!pressOn_) {
     pressActive_ = false;
@@ -540,7 +568,38 @@ inline void PhysicsWorld::updatePressure(int32_t gx, int32_t gy) {
   pressRayY_ = fx::halve(fx::neg(pressUy_));
   pressKg_ = fx::mul(press_, gmag);
   pressActive_ = (pressKg_ != 0);
-  if (pressActive_) buildPressureDepth();
+  if (pressActive_) {
+    if (muYield_ != 0) {
+      // 侧向与重力垂直；这对偏移对全场相同，每子步算一次，不逐块重算。
+      const int32_t sx = fx::neg(pressUy_);
+      const int32_t sy = pressUx_;
+      int32_t bestP = 0, bestM = 0;
+      int8_t pdx = 0, pdy = 0, mdx = 0, mdy = 0;
+      bool haveP = false, haveM = false;
+      for (uint8_t k = 0; k < 8; k++) {
+        const LateralOffset &o = LATERAL_OFFSETS[k];
+        const int32_t dot = fx::add(fx::mul(fx::fromFloat((double)o.dx), sx),
+                                    fx::mul(fx::fromFloat((double)o.dy), sy));
+        if (!haveP || dot > bestP) {
+          bestP = dot;
+          pdx = o.dx;
+          pdy = o.dy;
+          haveP = true;
+        }
+        if (!haveM || dot < bestM) {
+          bestM = dot;
+          mdx = o.dx;
+          mdy = o.dy;
+          haveM = true;
+        }
+      }
+      latPdx_ = pdx;
+      latPdy_ = pdy;
+      latMdx_ = mdx;
+      latMdy_ = mdy;
+    }
+    buildPressureDepth();
+  }
 }
 
 inline void PhysicsWorld::buildPressureDepth() {
@@ -594,6 +653,12 @@ inline void PhysicsWorld::buildPressureDepth() {
 inline void PhysicsWorld::pressureAccel(uint8_t i, int32_t &fx, int32_t &fy) const {
   const Block &b = blocks_[i];
   const int32_t own = pressDepth_[b.cx + b.cy * (int16_t)W_];
+  // 颗粒模式的屈服门只在「上面压着料」的块上讨论；自由面没有竖向载荷，也不该由压强推走。
+  if (muYield_ != 0 && own <= 0) {
+    fx = 0;
+    fy = 0;
+    return;
+  }
   // 墙外返回自身水头：墙的法向反作用平衡掉这一侧，不计压差。
   auto neighbor = [&](int16_t x, int16_t y) -> int32_t {
     if (x < 0 || x >= (int16_t)W_ || y < 0 || y >= (int16_t)H_) return own;
@@ -606,38 +671,66 @@ inline void PhysicsWorld::pressureAccel(uint8_t i, int32_t &fx, int32_t &fy) con
   const int32_t gpar = fx::add(fx::mul(gcx, pressUx_), fx::mul(gcy, pressUy_));
   const int32_t tx = fx::sub(gcx, fx::mul(gpar, pressUx_));
   const int32_t ty = fx::sub(gcy, fx::mul(gpar, pressUy_));
+  if (muYield_ != 0) {
+    // 自由竖列：两侧都没有相邻料块（墙不算侧向支撑）。自由竖列没有侧向围压，屈服阈值恒为零。
+    auto blocked = [&](int16_t x, int16_t y) -> bool {
+      return x >= 0 && x < (int16_t)W_ && y >= 0 && y < (int16_t)H_ &&
+             owner_[x + y * (int16_t)W_] >= 0;
+    };
+    const bool freeTower =
+        !blocked((int16_t)(b.cx + latPdx_), (int16_t)(b.cy + latPdy_)) &&
+        !blocked((int16_t)(b.cx + latMdx_), (int16_t)(b.cy + latMdy_));
+    // Mohr–Coulomb：有侧向支撑时，侧向坡度不够大就不推。
+    if (!freeTower && fx::hypot(tx, ty) <= fx::mul(muYield_, own)) {
+      fx = 0;
+      fy = 0;
+      return;
+    }
+  }
   fx = fx::neg(fx::mul(pressKg_, tx));
   fy = fx::neg(fx::mul(pressKg_, ty));
   // 两侧都是自由面、水头也相等时是真正的对称简并：按「朝板心一侧倒」做确定性破缺。
   if (tx == 0 && ty == 0 && own > 0) {
     const int32_t sx = fx::neg(pressUy_);
     const int32_t sy = pressUx_;
-    int32_t bestP = 0, bestM = 0;
     int8_t pdx = 0, pdy = 0, mdx = 0, mdy = 0;
-    bool haveP = false, haveM = false;
-    for (uint8_t k = 0; k < 8; k++) {
-      const CohesionOffset &o = COHESION_OFFSETS[k];
-      const int32_t dot = fx::add(fx::mul(fx::fromFloat((double)o.dx), sx),
-                                  fx::mul(fx::fromFloat((double)o.dy), sy));
-      if (!haveP || dot > bestP) {
-        bestP = dot;
-        pdx = o.dx;
-        pdy = o.dy;
-        haveP = true;
+    bool canPush = false;
+    if (muYield_ != 0) {
+      // 屈服门已经保证：非自由竖列在 tx = ty = 0 时（坡度 0 ≤ μ·own）已经返回了。
+      pdx = latPdx_;
+      pdy = latPdy_;
+      mdx = latMdx_;
+      mdy = latMdy_;
+      canPush = true;
+    } else {
+      int32_t bestP = 0, bestM = 0;
+      bool haveP = false, haveM = false;
+      for (uint8_t k = 0; k < 8; k++) {
+        const CohesionOffset &o = COHESION_OFFSETS[k];
+        const int32_t dot = fx::add(fx::mul(fx::fromFloat((double)o.dx), sx),
+                                    fx::mul(fx::fromFloat((double)o.dy), sy));
+        if (!haveP || dot > bestP) {
+          bestP = dot;
+          pdx = o.dx;
+          pdy = o.dy;
+          haveP = true;
+        }
+        if (!haveM || dot < bestM) {
+          bestM = dot;
+          mdx = o.dx;
+          mdy = o.dy;
+          haveM = true;
+        }
       }
-      if (!haveM || dot < bestM) {
-        bestM = dot;
-        mdx = o.dx;
-        mdy = o.dy;
-        haveM = true;
-      }
+      auto empty = [&](int16_t x, int16_t y) -> bool {
+        return x >= 0 && x < (int16_t)W_ && y >= 0 && y < (int16_t)H_ &&
+               owner_[x + y * (int16_t)W_] < 0;
+      };
+      canPush = haveP && haveM &&
+                empty((int16_t)(b.cx + pdx), (int16_t)(b.cy + pdy)) &&
+                empty((int16_t)(b.cx + mdx), (int16_t)(b.cy + mdy));
     }
-    auto empty = [&](int16_t x, int16_t y) -> bool {
-      return x >= 0 && x < (int16_t)W_ && y >= 0 && y < (int16_t)H_ &&
-             owner_[x + y * (int16_t)W_] < 0;
-    };
-    if (haveP && haveM && empty((int16_t)(b.cx + pdx), (int16_t)(b.cy + pdy)) &&
-        empty((int16_t)(b.cx + mdx), (int16_t)(b.cy + mdy))) {
+    if (canPush) {
       const int32_t dcx = fx::sub(fx::fromFloat((W_ - 1) * 0.5), fx::fromFloat((double)b.cx));
       const int32_t dcy = fx::sub(fx::fromFloat((H_ - 1) * 0.5), fx::fromFloat((double)b.cy));
       const int32_t toward = fx::add(fx::mul(dcx, sx), fx::mul(dcy, sy));

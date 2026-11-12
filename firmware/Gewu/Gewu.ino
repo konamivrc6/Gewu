@@ -115,6 +115,11 @@ static const double   STEEL_PLATE_FRICTION = 0.003;
 static const double   STEEL_PAIR_FRICTION  = 0.15;
 static const double   STEEL_RESTITUTION    = 0.78;
 static const double   STEEL_DAMPING        = 0.9999;
+// 屈服门压强：只在「侧向坡度 > μ·own」或「自由竖列」上施加静水压强项。
+// 0.15 来自 §4.6 的台面扫描：0.05~0.15 之间钢珠比豆子摊得更平；0.15 时 3 颗竖列约 0.12 s 塌。
+// 水模式仍走不带门的纯压强（yieldMu = 0），h 的语义不变。
+static const double   STEEL_HYDROSTATIC    = 0.15;
+static const double   PARTICLE_HYDROSTATIC = 0.15;
 static const uint32_t I2C_HZ          = 400000;
 static const uint32_t K_MAX           = 60000;    // k 命令一次最多推进多少帧，防止串口挂死
 static const uint32_t TRACE_MAX_FRAME = 5000;
@@ -648,6 +653,7 @@ static void applyMode(uint8_t mode) {
       world.setCohesionDiagFloat(WATER_COHESION_DIAG);
       world.setCohesionDampingFloat(WATER_COHESION_DAMP);
       world.setHydrostaticFloat(WATER_HYDROSTATIC_INIT);
+      world.setYieldMuFloat(0.0);
       world.setDampingQ16(fx::fromFloat(WATER_DAMPING));
       break;
     case MODE_STEEL:
@@ -657,7 +663,8 @@ static void applyMode(uint8_t mode) {
       world.setDampingQ16(fx::fromFloat(STEEL_DAMPING));
       world.setCohesionFloat(0.0);
       world.setCohesionDampingFloat(0.0);
-      world.setHydrostaticFloat(0.0);
+      world.setHydrostaticFloat(STEEL_HYDROSTATIC);
+      world.setYieldMuFloat(STEEL_PAIR_FRICTION);
       break;
     default:   // MODE_PARTICLES
       world.setPlateFrictionQ16(fx::fromFloat(PLATE_FRICTION_INIT));
@@ -666,7 +673,8 @@ static void applyMode(uint8_t mode) {
       world.setDampingQ16(fx::fromFloat(PARTICLE_DAMPING));
       world.setCohesionFloat(0.0);
       world.setCohesionDampingFloat(0.0);
-      world.setHydrostaticFloat(0.0);
+      world.setHydrostaticFloat(PARTICLE_HYDROSTATIC);
+      world.setYieldMuFloat(PAIR_FRICTION_INIT);
       break;
   }
   // 按新模式的重力标度立刻刷新；IMU 就绪时下一个 5 ms 节拍会用真实姿态覆盖。切换模式不清空粒子，停转没有副作用。
@@ -885,6 +893,7 @@ static void printHelp() {
   Serial.println(F("  a [0-99]        设内聚力（万分之一，a 10 = 0.0010；水模式默认 4）；不带参数报当前值"));
   Serial.println(F("  j [0-100]       设键轴黏性（百分数；水模式默认 4）；不带参数报当前值"));
   Serial.println(F("  h [0-999]       设静水压强增益（百分数，默认 100；0 = 关闭）；不带参数报当前值"));
+  Serial.println(F("  y [0-999]       设屈服门 μ（千分之一，例如 y 150 = 0.15；0 = 关闭，水模式必须为 0）；不带参数报当前值"));
   Serial.println(F("  s               打印状态、统计与不变量"));
   Serial.println(F("  k N             同步推进 N 帧（台面测试用，会阻塞输入）"));
   Serial.println(F("  v plain|friction|spin|water [帧数]   确定性 trace；前三种对照 sim/particle/port_trace.py，water 对照 sim/water/port_trace.py"));
@@ -909,13 +918,13 @@ static void printStatus() {
                 (unsigned long)st.commits, (unsigned long)st.blocked, (unsigned long)st.wall,
                 (unsigned long)st.adds, (unsigned long)st.removes,
                 (unsigned long)st.addFailFull, (unsigned long)st.addFailBad);
-  Serial.printf("[STA] G=%d gx=%d gy=%d gn=%d fdv=%d gscale=%.4f mup=%.4f mu=%.2f e=%.2f damp=%.4f vmax=%.3f coh=%.4f cohdiag=%.2f cohvisc=%.2f press=%.2f\n",
+  Serial.printf("[STA] G=%d gx=%d gy=%d gn=%d fdv=%d gscale=%.4f mup=%.4f mu=%.2f e=%.2f damp=%.4f vmax=%.3f coh=%.4f cohdiag=%.2f cohvisc=%.2f press=%.2f yield=%.2f\n",
                 (int)world.gravityTotalQ16(), (int)world.gravityXQ16(), (int)world.gravityYQ16(),
                 (int)world.normalQ16(), (int)world.fdvQ16(), gravityPerG,
                 fx::toFloat(world.plateFrictionQ16()), fx::toFloat(world.pairFrictionQ16()),
                 fx::toFloat(world.restitutionQ16()),
                 fx::toFloat(world.dampingQ16()), fx::toFloat(world.vmaxQ16()),
-                p.cohesion, p.cohesionDiag, p.cohesionDamping, p.hydrostatic);
+                p.cohesion, p.cohesionDiag, p.cohesionDamping, p.hydrostatic, p.yieldMu);
   Serial.printf("[STA] imu=%s fail=%u gxS=%+.3f gyS=%+.3f gzS=%+.3f\n",
                 imuReady ? imuModelName(imuKind) : "NONE", (unsigned)imuFailCount,
                 lastGx, lastGy, lastGz);
@@ -1238,6 +1247,20 @@ static void runCommand(char *line) {
       {
         char buf[32];
         snprintf(buf, sizeof(buf), "h %.2f", world.hydrostatic());
+        eventLine("[CMD]", buf);
+      }
+      break;
+
+    case 'y':
+      if (nw > 2) { ackErr("err y N"); return; }
+      if (nw == 2) {
+        uint32_t v = 0;
+        if (!parseU32(w[1], 999, &v)) { ackErr("err y 0..999"); return; }
+        world.setYieldMuFloat((double)v / 1000.0);
+      }
+      {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "y %.3f", world.yieldMu());
         eventLine("[CMD]", buf);
       }
       break;

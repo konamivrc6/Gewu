@@ -46,6 +46,8 @@
 **水模式（可选）**：`Params.cohesion` 打开八邻域内聚力，`cohesion_damping` 是沿键轴的相对速度阻尼，`wetting` 是接触线力，`wall_adhesion` 是壁面虚拟格的法向吸附。四个量默认全 0，粒子模式的路径逐位不变。方向只取格偏移而不取连续位置：八邻域全满时向量和为零，净力只出现在边界，体内没有剪切刚度。一格一颗保证不可压缩，所以内聚力只负责液-气界面的收缩，不需要密度与压力求解。原型与实验在 `sim/water/water.py`。
 
 **静水压强（`Params.hydrostatic`）**：内聚力只让液-气界面收缩，它不传递竖直方向上的重量，所以一根竖立的水柱在格点模型里是完全平衡的——下面的粒子各自被下面一格挡住，上面那份重量没有任何通道变成横向推力。真实液体里这份重量就是压强：`p = ρ g h`，两个相邻液柱的底面压强差会把水从高柱推向低柱。这里把这一项显式补上：每格沿**真实重力反方向**（不是量化到格轴）以半格步长射线前进，找到最后一个还有水的采样点，再用射线穿过最后一格边界的位置把水头插值成连续值；然后对四邻域的水头做中心差分，扣掉沿重力分量，只保留垂直分量作为横向加速度，系数与 `g∥` 成正比。重力方向全程连续，手上慢慢转板子时力的方向不会跳。两侧都是自由面且水头相等时是个真正的对称简并（真实液体靠热涨落破缺），这里按确定性规则朝板心一侧倒，保证左右镜像等变、trace 可复现。重力为零时这一项恒为零，零重力水珠仍只由内聚力决定。
+
+**屈服门（`Params.yield_mu`）**：纯压强是水机制——自由面两侧的水头差永远把界面往外推，所以水柱会一直流到平。颗粒不该这样：摩擦能把坡度撑住，直到坡度超过 `arctan(μ)`。`yield_mu > 0` 时给压强项加一道 Mohr–Coulomb 门：`hypot(tx, ty) > μ·own` 才推，否则这块保持不动；两侧都没有料块的自由竖列没有侧向围压，门槛恒为零，照推。这样同一个压强增益下，μ 小的钢珠会把料堆摊得更平，μ 大的豆子会停在更陡的台阶上。台阶间距只能取 `arctan(1/n)` 这一族（45°、27°、18°…），不是连续角度——方格能表达的坡度就是这些。`yield_mu = 0` 是水模式的旧路径，逐位不变。
 """
 
 from __future__ import annotations
@@ -107,6 +109,10 @@ class Params:
         self.wetting_gain = 1.0         # 接触线力增益。格点模型缺了连续介质的集体压力，1 往往推不动接触线
         self.wall_adhesion = 0.0        # 壁面虚拟水格的法向吸附强度，相对 cohesion。高值会把水横向压向中间，先默认关
         self.hydrostatic = 0.0          # 静水压强增益，0 = 关闭。横向加速度 = gain · g∥ · 两侧水柱的深度差
+        # 屈服门。0 = 不设门（水模式：纯压强，自由面也会被推）。>0 = 颗粒模式：把该值当作摩擦系数 μ，
+        # 只有当侧向水头坡度的模长超过 μ·own，或者块是两侧都没有料块的自由竖列时，才施加压强项。
+        # 于是料堆会在 arctan(μ) 对应的台阶间距上停住，而自由竖列没有侧向围压，恒屈服。
+        self.yield_mu = 0.0
         for k, v in kw.items():
             setattr(self, k, v)
 
@@ -151,6 +157,8 @@ class World2:
             raise ValueError(f"cohesion 不能为负，收到 {params.cohesion}")
         if params.hydrostatic < 0.0:
             raise ValueError(f"hydrostatic 不能为负，收到 {params.hydrostatic}")
+        if params.yield_mu < 0.0:
+            raise ValueError(f"yield_mu 不能为负，收到 {params.yield_mu}")
         self.aco = from_float(params.cohesion)
         self.acod = from_float(params.cohesion * params.cohesion_diag)
         self.cdamp = from_float(params.cohesion_damping)
@@ -178,6 +186,10 @@ class World2:
         self.press_ray_x = 0
         self.press_ray_y = -(ONE >> 1)
         self.press_depth = [0] * (self.W * self.H)
+        # 屈服门：μ 与「最接近 ±侧向」的一对格偏移。偏移只依赖重力方向，每子步算一次，不逐块重算。
+        self.mu_yield = from_float(params.yield_mu)
+        self.press_lat_p = (0, 0)
+        self.press_lat_m = (0, 0)
         self.blocks = []
         self.owner = [-1] * (self.W * self.H)
         self.stats = {"commits": 0, "blocked": 0, "wall": 0}
@@ -402,6 +414,10 @@ class World2:
         self.press_kg = mul(self.press, gmag)
         self.press_active = self.press_kg != 0
         if self.press_active:
+            if self.mu_yield != 0:
+                # 侧向与重力垂直；「最接近 +s / −s」的一对格偏移对全场相同，每子步算一次。
+                sx, sy = neg(self.press_uy), self.press_ux
+                self.press_lat_p, self.press_lat_m = self._lateral_pair(sx, sy)
             self._build_depth()
 
     def _build_depth(self) -> None:
@@ -449,16 +465,33 @@ class World2:
             nq = add(from_float(n), best_f)          # 半格计数，含小数
             depth[b.cx + b.cy * self.W] = halve(sub(nq, ONE)) if nq > ONE else 0
 
+    def _lateral_pair(self, sx, sy):
+        """找与侧向 s 最接近、最背离的一对八邻域偏移。选择顺序与原来逐块搜索完全一致，结果逐位不变。"""
+        best_p = best_m = None
+        for ox, oy in ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)):
+            dot = add(mul(from_float(ox), sx), mul(from_float(oy), sy))
+            if best_p is None or dot > best_p[0]:
+                best_p = (dot, ox, oy)
+            if best_m is None or dot < best_m[0]:
+                best_m = (dot, ox, oy)
+        return (best_p[1], best_p[2]), (best_m[1], best_m[2])
+
     def _pressure(self, i: int):
         """单块的静水压强加速度：对水头表做中心差分，再扣掉沿重力分量。
 
         `p = ρg·h` 的梯度里，沿重力那一半正好抵消重力，已经由接触与法向支撑处理；这里只施加垂直分量，避免重复抵消。
         两侧都是自由面、水头也相等时是真正的对称简并：按「朝板心一侧倒」做确定性破缺，规则关于板心镜像等变，不引入随机数。
+
+        `yield_mu > 0` 时加一道 Mohr–Coulomb 屈服门：有侧向支撑的块，侧向坡度 `hypot(tx, ty)` 不超过 `μ·own` 就不推；两侧都没有料块的自由竖列没有侧向围压，阈值恒为零，照推。于是料堆会停在 `arctan(μ)` 对应的台阶间距上，自由竖列必塌，而水模式（`yield_mu = 0`）仍走原来那条不设门的路径，逐位不变。
         """
         b = self.blocks[i]
         W, H = self.W, self.H
         depth = self.press_depth
         own = depth[b.cx + b.cy * W]
+        # 颗粒模式的屈服门只在「上面压着料」的块上讨论；自由面（own = 0）没有竖向载荷，
+        # 也不该由压强把它推走——那是液体找平的行为。水模式（yield_mu = 0）不跳这一步。
+        if self.mu_yield != 0 and own <= 0:
+            return 0, 0
 
         def neighbor(x, y):
             if not (0 <= x < W and 0 <= y < H):
@@ -474,23 +507,35 @@ class World2:
         gpar = add(mul(gcx, self.press_ux), mul(gcy, self.press_uy))
         tx = sub(gcx, mul(gpar, self.press_ux))
         ty = sub(gcy, mul(gpar, self.press_uy))
+        if self.mu_yield != 0:
+            # 自由竖列：两侧都没有相邻料块（墙不算侧向支撑）。自由竖列没有侧向围压，屈服阈值恒为零。
+            pdx, pdy = self.press_lat_p
+            mdx, mdy = self.press_lat_m
+
+            def blocked(x, y):
+                return 0 <= x < W and 0 <= y < H and self.owner[x + y * W] >= 0
+
+            free = not blocked(b.cx + pdx, b.cy + pdy) and not blocked(b.cx + mdx, b.cy + mdy)
+            # Mohr–Coulomb：有侧向支撑时，侧向坡度不够大就不推。μ = 0 的纯压强（水）不走这条。
+            if not free and hypot(tx, ty) <= mul(self.mu_yield, own):
+                return 0, 0
         ax = neg(mul(self.press_kg, tx))
         ay = neg(mul(self.press_kg, ty))
         if tx == 0 and ty == 0 and own > 0:
             # 找与真实侧向最接近的一对邻居；两边都空才是自由站立的窄柱。墙侧会给出非零梯度，走不到这里。
             sx, sy = neg(self.press_uy), self.press_ux
-            best_p = best_m = None
-            for ox, oy in ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)):
-                dot = add(mul(from_float(ox), sx), mul(from_float(oy), sy))
-                if best_p is None or dot > best_p[0]:
-                    best_p = (dot, ox, oy)
-                if best_m is None or dot < best_m[0]:
-                    best_m = (dot, ox, oy)
+            if self.mu_yield != 0:
+                # 屈服门已经保证：非自由竖列在 tx = ty = 0 时（坡度 0 ≤ μ·own）已经返回了。
+                (pdx, pdy), (mdx, mdy) = self.press_lat_p, self.press_lat_m
+                can_push = True
+            else:
+                (pdx, pdy), (mdx, mdy) = self._lateral_pair(sx, sy)
 
-            def empty(x, y):
-                return 0 <= x < W and 0 <= y < H and self.owner[x + y * W] < 0
+                def empty(x, y):
+                    return 0 <= x < W and 0 <= y < H and self.owner[x + y * W] < 0
 
-            if empty(b.cx + best_p[1], b.cy + best_p[2]) and empty(b.cx + best_m[1], b.cy + best_m[2]):
+                can_push = empty(b.cx + pdx, b.cy + pdy) and empty(b.cx + mdx, b.cy + mdy)
+            if can_push:
                 dcx = sub(from_float((W - 1) * 0.5), from_float(b.cx))
                 dcy = sub(from_float((H - 1) * 0.5), from_float(b.cy))
                 toward = add(mul(dcx, sx), mul(dcy, sy))
